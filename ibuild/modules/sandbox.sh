@@ -1,73 +1,100 @@
 #!/usr/bin/env bash
-# sandbox.sh - módulo de sandbox para ibuild
-# Usa systemd-nspawn para isolar compilações
+# sandbox.sh - isolamento para builds no ibuild
+
+set -euo pipefail
 
 source "$(dirname "$0")/utils.sh"
+source "$(dirname "$0")/hooks.sh"
 
-BASE_DIR="/var/lib/ibuild/sandboxes"
+SANDBOX_BASE="/var/lib/ibuild/sandbox"
+SANDBOX_CACHE="/var/cache/ibuild/sandbox"
+mkdir -p "$SANDBOX_BASE" "$SANDBOX_CACHE"
 
-sandbox_create() {
-    local name="$1"
-    local dir="$BASE_DIR/$name"
+# ============================================================
+# Preparar sandbox rootfs
+# ============================================================
 
-    if [ -d "$dir" ]; then
-        log "Sandbox '$name' já existe em $dir"
-        return 1
-    fi
+sandbox_prepare_rootfs() {
+    local pkg="$1"
+    local rootfs="$SANDBOX_BASE/$pkg"
 
-    log "Criando sandbox em $dir"
-    sudo mkdir -p "$dir"/{bin,sbin,lib,lib64,usr,etc,var,run,tmp,build}
-    sudo chmod 1777 "$dir/tmp"
-    log "Sandbox vazio criado"
+    # Se já existir, limpa
+    rm -rf "$rootfs"
+    mkdir -p "$rootfs"
+
+    # Base mínima: /usr, /bin, /lib, /etc
+    mkdir -p "$rootfs"/{usr,bin,lib,etc,tmp,build,package}
+    chmod 1777 "$rootfs/tmp"
+
+    # Montar cache de fontes compartilhado
+    mkdir -p "$SANDBOX_CACHE/sources"
+    mount --bind /var/cache/ibuild/sources "$rootfs/build/sources"
+
+    echo "$rootfs"
 }
+
+# ============================================================
+# Entrar no sandbox com systemd-nspawn
+# ============================================================
 
 sandbox_enter() {
-    local name="$1"
-    local dir="$BASE_DIR/$name"
+    local srcdir="$1"
+    local pkg="$(basename "$srcdir")"
+    local rootfs
+    rootfs="$(sandbox_prepare_rootfs "$pkg")"
 
-    [ -d "$dir" ] || { log "Sandbox '$name' não existe"; return 1; }
+    log ">> Iniciando sandbox para $pkg"
 
-    log "Entrando no sandbox '$name'..."
-    sudo systemd-nspawn -D "$dir" --bind="$dir/build":/build /bin/bash --login
+    hooks_run_phase sandbox pre
+
+    # Copiar source para dentro do sandbox
+    mkdir -p "$rootfs/build/$pkg"
+    rsync -a "$srcdir"/ "$rootfs/build/$pkg/"
+
+    # Iniciar container
+    systemd-nspawn \
+        --quiet \
+        --ephemeral \
+        --directory="$rootfs" \
+        --setenv=DESTDIR=/package \
+        --setenv=PATH=/usr/bin:/bin \
+        /bin/bash <<'EOF'
+        echo "[sandbox] Ambiente isolado pronto."
+EOF
+
+    hooks_run_phase sandbox post
 }
 
-sandbox_build() {
-    local name="$1"
+# ============================================================
+# Executar comandos dentro do sandbox
+# ============================================================
+
+sandbox_exec() {
+    local pkg="$1"
     shift
-    local dir="$BASE_DIR/$name"
+    local cmd=("$@")
 
-    [ -d "$dir" ] || { log "Sandbox '$name' não existe"; return 1; }
-    [ $# -gt 0 ] || { log "Uso: ibuild sandbox build <nome> <comando>"; return 1; }
+    local rootfs="$SANDBOX_BASE/$pkg"
+    [ -d "$rootfs" ] || { log "ERRO: sandbox não encontrado para $pkg"; exit 1; }
 
-    local cmd="$*"
-    local unit="ibuild-${name}-build.service"
-
-    log "Rodando build no sandbox '$name' como unidade $unit"
-    sudo systemd-run --unit="$unit" --property=Slice=machine.slice \
-        /usr/bin/systemd-nspawn -D "$dir" \
-        --bind="$dir/build":/build \
-        /bin/bash -lc "$cmd"
+    systemd-nspawn \
+        --quiet \
+        --directory="$rootfs" \
+        --setenv=DESTDIR=/package \
+        --setenv=PATH=/usr/bin:/bin \
+        "${cmd[@]}"
 }
 
-sandbox_remove() {
-    local name="$1"
-    local dir="$BASE_DIR/$name"
+# ============================================================
+# Sair e destruir sandbox
+# ============================================================
 
-    log "Removendo sandbox '$name'"
-    sudo rm -rf "$dir"
-}
-
-sandbox_main() {
-    local action="${1:-}"
-    shift || true
-
-    case "$action" in
-        create) sandbox_create "$@" ;;
-        enter)  sandbox_enter "$@" ;;
-        build)  sandbox_build "$@" ;;
-        remove) sandbox_remove "$@" ;;
-        *)
-            echo "Uso: ibuild sandbox {create|enter|build|remove} <args>"
-            ;;
-    esac
+sandbox_exit() {
+    local pkg="$1"
+    local rootfs="$SANDBOX_BASE/$pkg"
+    if [ -d "$rootfs" ]; then
+        log ">> Limpando sandbox $pkg"
+        umount -f "$rootfs/build/sources" 2>/dev/null || true
+        rm -rf "$rootfs"
+    fi
 }
