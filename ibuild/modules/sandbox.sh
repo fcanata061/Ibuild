@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# sb-indep.sh - sandbox independente, apenas systemd-nspawn
+# sandbox.sh - módulo de sandbox para ibuild
+# Usa systemd-nspawn para isolar compilações
 
-set -euo pipefail
+source "$(dirname "$0")/utils.sh"
 
-BASE_DIR="/var/lib/sbmanager"
-
-log() { printf '[*] %s\n' "$*"; }
+BASE_DIR="/var/lib/ibuild/sandboxes"
 
 sandbox_create() {
     local name="$1"
@@ -17,19 +16,16 @@ sandbox_create() {
     fi
 
     log "Criando sandbox em $dir"
-    mkdir -p "$dir"/{bin,sbin,lib,lib64,usr,etc,var,run,tmp,build}
-    chmod 1777 "$dir/tmp"
-    log "Sandbox vazio criado. (precisa compilar e instalar pacotes base depois)"
+    sudo mkdir -p "$dir"/{bin,sbin,lib,lib64,usr,etc,var,run,tmp,build}
+    sudo chmod 1777 "$dir/tmp"
+    log "Sandbox vazio criado"
 }
 
 sandbox_enter() {
     local name="$1"
     local dir="$BASE_DIR/$name"
 
-    if [ ! -d "$dir" ]; then
-        log "Sandbox '$name' não existe"
-        return 1
-    fi
+    [ -d "$dir" ] || { log "Sandbox '$name' não existe"; return 1; }
 
     log "Entrando no sandbox '$name'..."
     sudo systemd-nspawn -D "$dir" --bind="$dir/build":/build /bin/bash --login
@@ -40,17 +36,11 @@ sandbox_build() {
     shift
     local dir="$BASE_DIR/$name"
 
-    if [ ! -d "$dir" ]; then
-        log "Sandbox '$name' não existe"
-        return 1
-    fi
-    if [ $# -eq 0 ]; then
-        log "Uso: $0 build <sandbox> <comando...>"
-        return 1
-    fi
+    [ -d "$dir" ] || { log "Sandbox '$name' não existe"; return 1; }
+    [ $# -gt 0 ] || { log "Uso: ibuild sandbox build <nome> <comando>"; return 1; }
 
     local cmd="$*"
-    local unit="sb-${name}-build.service"
+    local unit="ibuild-${name}-build.service"
 
     log "Rodando build no sandbox '$name' como unidade $unit"
     sudo systemd-run --unit="$unit" --property=Slice=machine.slice \
@@ -67,12 +57,17 @@ sandbox_remove() {
     sudo rm -rf "$dir"
 }
 
-case "${1:-}" in
-    create) sandbox_create "$2" ;;
-    enter)  sandbox_enter "$2" ;;
-    build)  shift; sandbox_build "$@" ;;
-    remove) sandbox_remove "$2" ;;
-    *)
-        echo "Uso: $0 {create|enter|build|remove} <sandbox> [comando]"
-        ;;
-esac
+sandbox_main() {
+    local action="${1:-}"
+    shift || true
+
+    case "$action" in
+        create) sandbox_create "$@" ;;
+        enter)  sandbox_enter "$@" ;;
+        build)  sandbox_build "$@" ;;
+        remove) sandbox_remove "$@" ;;
+        *)
+            echo "Uso: ibuild sandbox {create|enter|build|remove} <args>"
+            ;;
+    esac
+}
