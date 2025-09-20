@@ -1,145 +1,71 @@
 #!/usr/bin/env bash
-# remove.sh - remoção de pacotes no ibuild (versão evoluída)
+# modules/remove.sh - remoção de pacotes no ibuild
 
 set -euo pipefail
 
 source "$(dirname "$0")/utils.sh"
 source "$(dirname "$0")/hooks.sh"
-source "$(dirname "$0")/dependency.sh"
 
 PKG_DIR="/var/lib/ibuild/packages"
-LOG_ROOT="$LOG_DIR"
+BIN_DIR="/var/cache/ibuild/packages-bin"
+LOG_DIR="/var/log/ibuild"
+mkdir -p "$PKG_DIR" "$BIN_DIR" "$LOG_DIR"
+
+REMOVE_LOG="$LOG_DIR/remove.log"
 
 # ============================================================
-# Remove um pacote individual
-# ============================================================
-_remove_pkg() {
-    local pkg="$1"
-    local force="$2"
-    local dry_run="$3"
-
-    local meta="$PKG_DIR/$pkg.meta"
-    [ -f "$meta" ] || { log "Pacote '$pkg' não está instalado"; return 0; }
-
-    source "$meta"  # name, version, files, essential?
-
-    # Pacotes essenciais só saem com --force
-    if [ "${essential:-0}" -eq 1 ] && [ "$force" -eq 0 ]; then
-        log "Pacote '$name' é essencial e não pode ser removido (use --force)"
-        exit 1
-    fi
-
-    log "=== Removendo pacote $name-$version ==="
-
-    local logdir="$LOG_ROOT/$name"
-    mkdir -p "$logdir"
-    local remove_log="$logdir/remove.log"
-    local hooks_log="$logdir/hooks.log"
-    local removed_files="$logdir/removed_files.log"
-    : >"$remove_log"
-    : >"$hooks_log"
-    : >"$removed_files"
-
-    if [ "$dry_run" -eq 1 ]; then
-        log "[DRY-RUN] Pacote $name seria removido"
-        echo "$files" | tr ' ' '\n' >>"$removed_files"
-        return 0
-    fi
-
-    (
-        hooks_run remove pre "$name" | tee -a "$hooks_log"
-
-        if [ -n "${files:-}" ]; then
-            log "[REMOVE] Apagando arquivos"
-            for f in $files; do
-                sudo rm -f "/$f" 2>/dev/null || true
-                echo "/$f" >>"$removed_files"
-            done
-        else
-            log "[WARN] Nenhuma lista de arquivos encontrada no meta"
-        fi
-
-        hooks_run remove post "$name" | tee -a "$hooks_log"
-    ) >>"$remove_log" 2>&1
-
-    # Apagar metadados
-    rm -f "$meta"
-
-    log "Pacote $name removido com sucesso"
-}
-
-# ============================================================
-# Ordem reversa de remoção
+# Remover pacote
 # ============================================================
 remove_pkg() {
     local pkg="$1"
-    local force="$2"
-    local recursive="$3"
-    local dry_run="$4"
-    local autoremove="$5"
 
-    log "Resolvendo ordem de remoção para $pkg"
+    local metafile="$PKG_DIR/$pkg/.meta"
+    local filesfile="$PKG_DIR/$pkg/.files"
 
-    local pkgs=()
-
-    if [ "$recursive" -eq 1 ]; then
-        # inclui dependentes recursivamente
-        pkgs="$(deps_remove_order "$pkg")"
-    else
-        pkgs="$pkg"
-    fi
-
-    for p in $pkgs; do
-        # checar dependentes antes de remover
-        if [ "$force" -eq 0 ] && [ "$recursive" -eq 0 ]; then
-            local revs
-            revs="$(reverse_deps "$p" || true)"
-            if [ -n "$revs" ]; then
-                log "Erro: não é seguro remover '$p'. Pacotes dependentes: $revs"
-                log "Use --force ou --recursive"
-                exit 1
-            fi
+    # Se não existir localmente, tenta fallback no BIN_DIR
+    if [ ! -f "$filesfile" ]; then
+        log ">> Manifesto não encontrado em $filesfile, tentando fallback..."
+        if [ -f "$BIN_DIR/$pkg.meta" ]; then
+            eval "$(grep -E '^(name|version)=' "$BIN_DIR/$pkg.meta")"
+            filesfile="$BIN_DIR/${name}-${version}.files"
         fi
-
-        _remove_pkg "$p" "$force" "$dry_run"
-    done
-
-    if [ "$autoremove" -eq 1 ]; then
-        log "Verificando pacotes órfãos..."
-        for f in "$PKG_DIR"/*.meta; do
-            [ -e "$f" ] || continue
-            local q; q="$(basename "$f" .meta)"
-            local revs; revs="$(reverse_deps "$q" || true)"
-            if [ -z "$revs" ]; then
-                log "Órfão detectado: $q"
-                [ "$dry_run" -eq 0 ] && _remove_pkg "$q" "$force" "$dry_run"
-            fi
-        done
     fi
+
+    [ -f "$filesfile" ] || { log "ERRO: Nenhum manifesto encontrado para $pkg"; exit 1; }
+
+    hooks_run_phase remove pre
+
+    log ">> Removendo pacote $pkg"
+    while read -r f; do
+        [ -z "$f" ] && continue
+
+        # Evitar remoção de diretórios críticos
+        case "$f" in
+            /|/usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/etc|/etc/*)
+                log "AVISO: Ignorando arquivo crítico: $f"
+                continue
+                ;;
+        esac
+
+        if [ -f "/$f" ] || [ -L "/$f" ]; then
+            sudo rm -f "/$f"
+            echo "REMOVED: /$f" >> "$REMOVE_LOG"
+        elif [ -d "/$f" ]; then
+            sudo rmdir --ignore-fail-on-non-empty "/$f" 2>/dev/null || true
+        fi
+    done < "$filesfile"
+
+    # Limpar registro local
+    rm -rf "$PKG_DIR/$pkg"
+
+    hooks_run_phase remove post
+
+    log ">> Remoção concluída: $pkg"
 }
 
-# ============================================================
-# Entry point
-# ============================================================
+# CLI
 remove_main() {
-    local force=0
-    local recursive=0
-    local dry_run=0
-    local autoremove=0
-    local pkg=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --force) force=1 ;;
-            --recursive) recursive=1 ;;
-            --dry-run) dry_run=1 ;;
-            --autoremove) autoremove=1 ;;
-            *) pkg="$1" ;;
-        esac
-        shift
-    done
-
-    [ -z "$pkg" ] && { log "Uso: ibuild remove <pacote> [--force] [--recursive] [--dry-run] [--autoremove]"; exit 1; }
-
-    remove_pkg "$pkg" "$force" "$recursive" "$dry_run" "$autoremove"
+    local pkg="$1"
+    shift || true
+    remove_pkg "$pkg" "$@"
 }
