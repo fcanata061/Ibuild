@@ -1,124 +1,79 @@
 #!/usr/bin/env bash
-# install.sh - instalação de pacotes no ibuild
+# modules/install.sh - instalação de pacotes no ibuild
 
 set -euo pipefail
 
 source "$(dirname "$0")/utils.sh"
 source "$(dirname "$0")/hooks.sh"
-source "$(dirname "$0")/sandbox.sh"
 source "$(dirname "$0")/dependency.sh"
 source "$(dirname "$0")/build.sh"
 
 PKG_DIR="/var/lib/ibuild/packages"
-LOG_DIR="/var/log/ibuild"
 BIN_DIR="/var/cache/ibuild/packages-bin"
-
-mkdir -p "$PKG_DIR" "$LOG_DIR" "$BIN_DIR"
+LOG_DIR="/var/log/ibuild"
+mkdir -p "$PKG_DIR" "$BIN_DIR" "$LOG_DIR"
 
 # ============================================================
-# Funções auxiliares
+# Instalar pacote binário
 # ============================================================
-
-install_from_bin() {
+install_bin_pkg() {
     local pkg="$1"
-    local meta="$PKG_DIR/$pkg.meta"
-    [ -f "$meta" ] || { log "ERRO: metadados de $pkg não encontrados"; exit 1; }
+    local metafile="$BIN_DIR/$pkg.meta"
 
-    source "$meta"
+    [ -f "$metafile" ] || { log "ERRO: .meta não encontrado para $pkg"; exit 1; }
 
-    local archive_zst="$BIN_DIR/${pkg}-${version}.tar.zst"
-    local archive_xz="$BIN_DIR/${pkg}-${version}.tar.xz"
-    local archive=""
+    # Carregar metadados
+    local name version rundep
+    eval "$(grep -E '^(name|version|rundep)=' "$metafile")"
 
-    if [ -f "$archive_zst" ]; then
-        archive="$archive_zst"
-    elif [ -f "$archive_xz" ]; then
-        archive="$archive_xz"
-    fi
+    local pkgfile="$BIN_DIR/${name}-${version}.tar.zst"
+    local manifest="$BIN_DIR/${name}-${version}.files"
 
-    [ -n "$archive" ] || { log "Nenhum pacote binário disponível para $pkg-$version"; return 1; }
+    [ -f "$pkgfile" ] || { log "ERRO: pacote binário não encontrado: $pkgfile"; exit 1; }
 
-    log ">> Instalando $pkg-$version a partir do pacote binário"
     hooks_run_phase install pre
 
-    local logf="$LOG_DIR/$pkg-install.log"
+    # Resolver dependências de runtime antes
+    if [ -n "${rundep:-}" ]; then
+        log ">> Resolvendo dependências de runtime: $rundep"
+        dependency_resolve "$rundep" | while read -r dep; do
+            [ -n "$dep" ] && ibuild install "$dep"
+        done
+    fi
 
-    if [[ "$archive" == *.zst ]]; then
-        zstd -dc "$archive" | tar -xf - -C /
-    else
-        xz -dc "$archive" | tar -xf - -C /
-    fi >>"$logf" 2>&1
+    # Instalar o pacote no sistema
+    log ">> Instalando $name-$version"
+    sudo tar --extract --preserve-permissions --same-owner -C / -f "$pkgfile"
+
+    # Salvar lista de arquivos
+    mkdir -p "$PKG_DIR/$pkg"
+    cp "$metafile" "$PKG_DIR/$pkg/.meta"
+    cp "$manifest" "$PKG_DIR/$pkg/.files"
 
     hooks_run_phase install post
 
-    log "Instalação de $pkg-$version concluída (binário)"
-}
-
-install_from_source() {
-    local pkg="$1"
-    log ">> Nenhum pacote binário para $pkg, compilando do source..."
-    build_pkg "$pkg"
-    install_from_bin "$pkg"
+    log ">> Instalação concluída: $name-$version"
 }
 
 # ============================================================
-# Instalação de dependências
+# Instalar (binário ou build se necessário)
 # ============================================================
-
-install_deps() {
-    local pkg="$1"
-    local meta="$PKG_DIR/$pkg.meta"
-    [ -f "$meta" ] || { log "Metadados de $pkg não encontrados"; exit 1; }
-
-    local deps
-    deps="$(get_rundeps "$pkg")"
-    if [ -n "$deps" ]; then
-        log "Resolvendo dependências de runtime para $pkg: $deps"
-        for dep in $deps; do
-            if [ ! -f "$PKG_DIR/$dep.meta" ]; then
-                log "Dependência '$dep' não instalada, instalando..."
-                install_pkg "$dep"
-            fi
-        done
-    fi
-}
-
-# ============================================================
-# Instalação principal
-# ============================================================
-
 install_pkg() {
     local pkg="$1"
-    local meta="$PKG_DIR/$pkg.meta"
+    local metafile="$PKG_DIR/$pkg/.meta"
 
-    [ -f "$meta" ] || { log "Pacote '$pkg' não encontrado"; exit 1; }
-    source "$meta"
-
-    # Se já instalado, pula
-    if [ -f "$PKG_DIR/$pkg.files" ]; then
-        log "Pacote '$pkg' já instalado"
-        return 0
+    # Se não existir binário, buildar antes
+    if [ ! -f "$BIN_DIR/$pkg.meta" ]; then
+        log ">> Pacote binário não encontrado, chamando build: $pkg"
+        build_pkg "$pkg"
     fi
 
-    # 1. Dependências de runtime
-    install_deps "$pkg"
-
-    # 2. Tenta binário, senão compila
-    if ! install_from_bin "$pkg"; then
-        install_from_source "$pkg"
-    fi
-
-    # 3. Registrar arquivos
-    tar -tf "$BIN_DIR/${pkg}-${version}.tar."* | sort > "$PKG_DIR/$pkg.files"
-    log "Arquivos registrados em $PKG_DIR/$pkg.files"
+    install_bin_pkg "$pkg"
 }
 
-# ============================================================
-# Entry point
-# ============================================================
-
+# CLI
 install_main() {
-    local pkg="${1:-}"
-    [ -n "$pkg" ] || { log "Uso: ibuild install <pacote>"; exit 1; }
-    install_pkg "$pkg"
+    local pkg="$1"
+    shift || true
+    install_pkg "$pkg" "$@"
 }
