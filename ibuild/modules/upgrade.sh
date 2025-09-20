@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # modules/upgrade.sh
-# Atualização de pacotes (upgrade) no ibuild
+# Atualização de pacotes (upgrade) no ibuild, com suporte transacional
 
 set -euo pipefail
 
 MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Carregar utils
+# Carregar utils e outros módulos
 # shellcheck disable=SC1090
 source "$MODULE_DIR/utils.sh"
 source "$MODULE_DIR/dependency.sh"
@@ -65,8 +65,7 @@ _mark_installed() {
 
 _upgrade_pkg() {
     local pkg="$1"
-    local action
-    action="$(_pkg_needs_upgrade "$pkg")"
+    local action="$2"  # install | upgrade
 
     case "$action" in
         install)
@@ -98,13 +97,73 @@ _upgrade_pkg() {
             _mark_installed "$pkg" "$new_ver"
             ok "$pkg atualizado de $old_ver para $new_ver"
             ;;
-        uptodate)
-            ok "$pkg já está na versão mais recente"
-            ;;
         *)
-            die "Erro interno: ação desconhecida $action"
+            die "Erro interno em _upgrade_pkg: ação inválida '$action'"
             ;;
     esac
+}
+
+# ============================================================
+# Transações
+# ============================================================
+
+_transaction_upgrade() {
+    local pkgs=("$@")
+    local fail=0
+    local rollback_list=()
+
+    log ">> Iniciando transação de upgrade para: ${pkgs[*]}"
+    ensure_dir "$STATE_DIR/transactions"
+
+    local txn_id; txn_id="$(date +%Y%m%d%H%M%S)"
+    local txn_dir="$STATE_DIR/transactions/$txn_id"
+    mkdir -p "$txn_dir"
+
+    for pkg in "${pkgs[@]}"; do
+        local action; action="$(_pkg_needs_upgrade "$pkg")"
+        if [ "$action" = "uptodate" ]; then
+            ok "$pkg já está atualizado"
+            continue
+        fi
+
+        log "[TXN] Preparando upgrade de $pkg ($action)"
+        # salvar estado
+        local old_ver="$(_pkg_installed_version "$pkg")"
+        echo "$old_ver" > "$txn_dir/$pkg.old"
+
+        # tentar upgrade
+        if _upgrade_pkg "$pkg" "$action"; then
+            rollback_list+=("$pkg")
+        else
+            warn "Falha no upgrade de $pkg, iniciando rollback"
+            fail=1
+            break
+        fi
+    done
+
+    if [ "$fail" -eq 1 ]; then
+        for pkg in "${rollback_list[@]}"; do
+            local old_ver
+            old_ver="$(cat "$txn_dir/$pkg.old")"
+            if [ "$old_ver" = "none" ]; then
+                log "[ROLLBACK] Removendo $pkg (não estava instalado antes)"
+                remove_pkg "$pkg" || warn "Falha ao remover $pkg no rollback"
+            else
+                log "[ROLLBACK] Reinstalando $pkg versão $old_ver"
+                # se tiver binário salvo, reinstalar
+                local bin="$BIN_DIR/$pkg-$old_ver.tar.*"
+                if ls $bin >/dev/null 2>&1; then
+                    tar -xf $bin -C / || warn "Falha ao restaurar $pkg"
+                    echo "$old_ver" | sudo tee "$STATE_DIR/$pkg.version" >/dev/null
+                else
+                    warn "Sem pacote binário de $pkg-$old_ver para rollback"
+                fi
+            fi
+        done
+        die "Transação abortada: rollback concluído"
+    else
+        ok "Transação concluída com sucesso"
+    fi
 }
 
 # ============================================================
@@ -117,25 +176,43 @@ Uso:
   ibuild upgrade [pacote...]
   ibuild upgrade --all
   ibuild upgrade --check
+  ibuild upgrade --sync <git-url> [options]
 
 Opções:
-  --all     Atualiza todos os pacotes instalados
-  --check   Apenas mostra pacotes que têm upgrade disponível
+  --all        Atualiza todos os pacotes instalados
+  --check      Apenas mostra pacotes que têm upgrade disponível
+  --sync       Atualiza receitas a partir de repositório Git antes do upgrade
+  --tx         Executa upgrade em modo transacional (rollback em falha)
 EOF
 }
 
 upgrade_main() {
     local mode="specific"
     local pkgs=()
+    local sync_repo=""
+    local use_tx=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --all) mode="all"; shift ;;
             --check) mode="check"; shift ;;
+            --sync)
+                mode="sync"
+                sync_repo="$2"
+                shift 2
+                ;;
+            --tx) use_tx=1; shift ;;
             --help) upgrade_usage; return 0 ;;
             *) pkgs+=("$1"); shift ;;
         esac
     done
+
+    if [ "$mode" = "sync" ]; then
+        log ">> Sincronizando receitas a partir do repo $sync_repo"
+        sync_main repo "$sync_repo" --subdir recipes
+        log ">> Receitas atualizadas, iniciando verificação de upgrades..."
+        mode="all"
+    fi
 
     if [ "$mode" = "all" ]; then
         mapfile -t pkgs < <(ls "$STATE_DIR"/*.version 2>/dev/null | xargs -n1 basename | sed 's/\.version//')
@@ -148,9 +225,18 @@ upgrade_main() {
 
     case "$mode" in
         specific|all)
-            for pkg in "${pkgs[@]}"; do
-                _upgrade_pkg "$pkg"
-            done
+            if [ "$use_tx" -eq 1 ]; then
+                _transaction_upgrade "${pkgs[@]}"
+            else
+                for pkg in "${pkgs[@]}"; do
+                    local action; action="$(_pkg_needs_upgrade "$pkg")"
+                    if [ "$action" != "uptodate" ]; then
+                        _upgrade_pkg "$pkg" "$action"
+                    else
+                        ok "$pkg já está atualizado"
+                    fi
+                done
+            fi
             ;;
         check)
             log "Verificando pacotes instalados..."
