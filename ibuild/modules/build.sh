@@ -13,7 +13,7 @@ LOG_DIR="/var/log/ibuild"
 SRC_CACHE="/var/cache/ibuild/sources"
 BIN_DIR="/var/cache/ibuild/packages-bin"
 
-mkdir -p "$LOG_DIR" "$SRC_CACHE" "$BIN_DIR"
+mkdir -p "$PKG_DIR" "$LOG_DIR" "$SRC_CACHE" "$BIN_DIR"
 
 # ============================================================
 # Helpers: fetch, verify, extract, patch
@@ -70,7 +70,6 @@ apply_patches() {
     local pkg="$2"
     local patchdir="$PKG_DIR/$pkg/patches"
 
-    # Manual (definido no .meta)
     if [ -n "${patches[*]:-}" ]; then
         hooks_run_phase patch pre
         for p in "${patches[@]}"; do
@@ -83,7 +82,6 @@ apply_patches() {
         return
     fi
 
-    # Automático (todos na pasta)
     if [ -d "$patchdir" ]; then
         local found=0
         hooks_run_phase patch pre
@@ -126,17 +124,14 @@ package_build() {
 
     log "Pacote gerado: $archive"
 
-    # Manifesto de arquivos
     tar -tf "$archive" | sort > "$PKG_DIR/$pkg.files"
-
-    # Salvar metadados junto ao pacote
     cp "$meta" "$PKG_DIR/$pkg.meta"
 
     hooks_run_phase package post
 }
 
 # ============================================================
-# Build principal
+# Build principal com sandbox
 # ============================================================
 
 build_pkg() {
@@ -165,7 +160,7 @@ build_pkg() {
     srcfile="$(fetch_source "$source" "$pkg")"
     verify_source "$srcfile" "${sha256:-}"
 
-    # 3. Preparar sandbox e extrair
+    # 3. Preparar diretórios de build
     local buildroot="/tmp/ibuild-$pkg-build"
     rm -rf "$buildroot"
     mkdir -p "$buildroot"
@@ -173,36 +168,42 @@ build_pkg() {
     local srcdir
     srcdir="$(find "$buildroot" -mindepth 1 -maxdepth 1 -type d | head -n1)"
 
-    # Diretório de instalação fake
     local pkgdir="$buildroot/pkgdir"
     mkdir -p "$pkgdir"
 
-    sandbox_enter "$srcdir"
-
-    # 4. Patches
+    # 4. Aplicar patches
     apply_patches "$srcdir" "$pkg"
 
     # 5. Hooks pré-build
     hooks_run_phase build pre
 
-    # 6. Build
+    # 6. Rodar build dentro do sandbox
     local logf="$LOG_DIR/$pkg-build.log"
-    (
-        cd "$srcdir"
-        log "Rodando etapa de build..."
-        eval "$build DESTDIR=$pkgdir"
-    ) >"$logf" 2>&1
+    sandbox_prepare_rootfs "$pkg" >/dev/null
+
+    log ">> Rodando build em sandbox..."
+    sandbox_exec "$pkg" bash -c "
+        cd /build/$pkg &&
+        $build DESTDIR=/package
+    " >\"$logf\" 2>&1
+
     log "Build concluído. Log em $logf"
 
     # 7. Hooks pós-build
     hooks_run_phase build post
 
-    # 8. Empacotamento
-    package_build "$pkg" "$version" "$pkgdir" "$meta"
+    # 8. Copiar resultado do sandbox
+    local rootfs="$SANDBOX_BASE/$pkg"
+    cp -a \"$rootfs/package/.\" \"$pkgdir/\"
 
-    # 9. Limpeza
-    sandbox_exit
-    log "Sandbox finalizado"
+    # 9. Empacotar
+    package_build \"$pkg\" \"$version\" \"$pkgdir\" \"$meta\"
+
+    # 10. Limpeza
+    sandbox_exit \"$pkg\"
+    rm -rf \"$buildroot\"
+
+    log \"Sandbox finalizado\"
 }
 
 # ============================================================
@@ -210,7 +211,7 @@ build_pkg() {
 # ============================================================
 
 build_main() {
-    local pkg="${1:-}"
-    [ -n "$pkg" ] || { log "Uso: ibuild build <pacote>"; exit 1; }
-    build_pkg "$pkg"
+    local pkg=\"${1:-}\"
+    [ -n \"$pkg\" ] || { log \"Uso: ibuild build <pacote>\"; exit 1; }
+    build_pkg \"$pkg\"
 }
