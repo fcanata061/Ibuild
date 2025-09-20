@@ -1,21 +1,39 @@
 #!/usr/bin/env bash
-# ibuild - gerenciador principal
+# ibuild - Gerenciador source-based independente
 
 set -euo pipefail
 
-MODULES_DIR="$(dirname "$0")/modules"
+# Diretório onde ficam os módulos
+IBUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
+MODULES_DIR="$IBUILD_DIR/modules"
+
+# Função de ajuda
+ibuild_usage() {
+    cat <<EOF
+Uso: ibuild <comando> [args]
+
+Comandos disponíveis:
+  sandbox   Gerenciar sandboxes de build (create, enter, build, remove)
+  install   (em breve) Instalar pacotes a partir do código-fonte
+  update    (em breve) Atualizar pacotes
+  remove    (em breve) Remover pacotes
+  log       (em breve) Ver logs de build
+
+Exemplo:
+  ibuild sandbox create base
+  ibuild sandbox enter base
+EOF
+}
 
 COMMAND="${1:-}"
 shift || true
 
 case "$COMMAND" in
     sandbox) source "$MODULES_DIR/sandbox.sh"; sandbox_main "$@" ;;
-    install) source "$MODULES_DIR/install.sh"; install_main "$@" ;;
-    update)  source "$MODULES_DIR/update.sh";  update_main "$@" ;;
-    remove)  source "$MODULES_DIR/remove.sh";  remove_main "$@" ;;
-    log)     source "$MODULES_DIR/log.sh";     log_main "$@" ;;
-    *)
-        echo "Uso: $0 {sandbox|install|update|remove|log} ..."
-        exit 1
-        ;;
+    install) echo "[!] install ainda não implementado"; exit 1 ;;
+    update)  echo "[!] update ainda não implementado"; exit 1 ;;
+    remove)  echo "[!] remove ainda não implementado"; exit 1 ;;
+    log)     echo "[!] log ainda não implementado"; exit 1 ;;
+    ""|-h|--help) ibuild_usage ;;
+    *) echo "Comando desconhecido: $COMMAND"; ibuild_usage; exit 1 ;;
 esac
