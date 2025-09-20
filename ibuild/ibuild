@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# ibuild - gerenciador principal
+
+set -euo pipefail
+
+MODULES_DIR="$(dirname "$0")/modules"
+
+COMMAND="${1:-}"
+shift || true
+
+case "$COMMAND" in
+    sandbox) source "$MODULES_DIR/sandbox.sh"; sandbox_main "$@" ;;
+    install) source "$MODULES_DIR/install.sh"; install_main "$@" ;;
+    update)  source "$MODULES_DIR/update.sh";  update_main "$@" ;;
+    remove)  source "$MODULES_DIR/remove.sh";  remove_main "$@" ;;
+    log)     source "$MODULES_DIR/log.sh";     log_main "$@" ;;
+    *)
+        echo "Uso: $0 {sandbox|install|update|remove|log} ..."
+        exit 1
+        ;;
+esac
