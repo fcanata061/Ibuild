@@ -1,20 +1,44 @@
 #!/usr/bin/env bash
-# Funções auxiliares
+# modules/utils.sh
+# Utilitários comuns para ibuild
 
-DB_DIR="/var/lib/ibuild/db"
-LOG_DIR="$DB_DIR/logs"
-META_DIR="$DB_DIR/installed"
+set -euo pipefail
 
-mkdir -p "$DB_DIR" "$LOG_DIR" "$META_DIR"
+# Cores (desativadas se NO_COLOR=1)
+if [ "${NO_COLOR:-0}" -eq 0 ] && [ -t 2 ]; then
+    C_RESET="\033[0m"
+    C_RED="\033[31m"
+    C_GREEN="\033[32m"
+    C_YELLOW="\033[33m"
+    C_BLUE="\033[34m"
+else
+    C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""
+fi
 
 log() {
-    printf "[ibuild] %s\n" "$*"
+    printf "${C_BLUE}[ibuild]${C_RESET} %s\n" "$*" >&2
 }
 
-pkg_meta_file() {
-    echo "$META_DIR/$1.meta"
+warn() {
+    printf "${C_YELLOW}[ibuild:WARN]${C_RESET} %s\n" "$*" >&2
 }
 
-pkg_installed() {
-    [ -f "$(pkg_meta_file "$1")" ]
+ok() {
+    printf "${C_GREEN}[ibuild:OK]${C_RESET} %s\n" "$*" >&2
+}
+
+die() {
+    printf "${C_RED}[ibuild:ERRO]${C_RESET} %s\n" "$*" >&2
+    exit 1
+}
+
+ensure_dir() {
+    local d="$1"
+    [ -d "$d" ] || mkdir -p "$d"
+}
+
+# Executa comando visível, falha se der erro
+run_cmd() {
+    log "Executando: $*"
+    "$@" || die "Falha no comando: $*"
 }
