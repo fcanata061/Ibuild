@@ -1,39 +1,61 @@
 #!/usr/bin/env bash
-# ibuild - Gerenciador source-based independente
+# ibuild - gerenciador de pacotes source-based com sandbox
+# Script central que integra todos os módulos
 
 set -euo pipefail
 
-# Diretório onde ficam os módulos
-IBUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
-MODULES_DIR="$IBUILD_DIR/modules"
+IBUILD_DIR="$(dirname "$0")"
+MODULE_DIR="$IBUILD_DIR/modules"
 
-# Função de ajuda
-ibuild_usage() {
+# Carregar módulos
+for mod in utils hooks sandbox dependency build install remove; do
+    source "$MODULE_DIR/$mod.sh"
+done
+
+usage() {
     cat <<EOF
-Uso: ibuild <comando> [args]
+ibuild - gerenciador de pacotes source-based
 
-Comandos disponíveis:
-  sandbox   Gerenciar sandboxes de build (create, enter, build, remove)
-  install   (em breve) Instalar pacotes a partir do código-fonte
-  update    (em breve) Atualizar pacotes
-  remove    (em breve) Remover pacotes
-  log       (em breve) Ver logs de build
+Uso:
+  ibuild build <pacote>       Construir pacote a partir do source
+  ibuild install <pacote>     Instalar pacote (binário ou compilar se faltar)
+  ibuild remove <pacote>      Remover pacote instalado
+  ibuild update <pacote>      Atualizar pacote (WIP)
+  ibuild info <pacote>        Mostrar informações do pacote
+  ibuild help                 Mostrar esta ajuda
 
-Exemplo:
-  ibuild sandbox create base
-  ibuild sandbox enter base
+Diretórios:
+  Packages: /var/lib/ibuild/packages
+  Sources:  /var/cache/ibuild/sources
+  Binaries: /var/cache/ibuild/packages-bin
+  Logs:     /var/log/ibuild
 EOF
 }
 
-COMMAND="${1:-}"
-shift || true
+# Dispatch
+main() {
+    local cmd="${1:-}"
+    shift || true
 
-case "$COMMAND" in
-    sandbox) source "$MODULES_DIR/sandbox.sh"; sandbox_main "$@" ;;
-    install) echo "[!] install ainda não implementado"; exit 1 ;;
-    update)  echo "[!] update ainda não implementado"; exit 1 ;;
-    remove)  echo "[!] remove ainda não implementado"; exit 1 ;;
-    log)     echo "[!] log ainda não implementado"; exit 1 ;;
-    ""|-h|--help) ibuild_usage ;;
-    *) echo "Comando desconhecido: $COMMAND"; ibuild_usage; exit 1 ;;
-esac
+    case "$cmd" in
+        build)   build_main "$@" ;;
+        install) install_main "$@" ;;
+        remove)  remove_main "$@" ;;
+        update)  log ">> Update ainda não implementado"; exit 1 ;;
+        info)
+            local pkg="${1:-}"
+            if [ -f "/var/lib/ibuild/packages/$pkg/.meta" ]; then
+                cat "/var/lib/ibuild/packages/$pkg/.meta"
+            elif [ -f "/var/cache/ibuild/packages-bin/$pkg.meta" ]; then
+                cat "/var/cache/ibuild/packages-bin/$pkg.meta"
+            else
+                log "ERRO: Nenhum meta encontrado para $pkg"
+                exit 1
+            fi
+            ;;
+        help|"") usage ;;
+        *) log "ERRO: comando desconhecido '$cmd'"; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
