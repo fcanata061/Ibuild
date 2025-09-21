@@ -1,0 +1,52 @@
+{
+  "name": "gcc-pass1",
+  "version": "13.2.0",
+  "description": "GCC stage1 (pass1) com bibliotecas gmp, mpfr, mpc, isl embutidas.",
+  "category": "base-devel",
+  "source": [
+    {
+      "url": "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz",
+      "sha256": "<SHA256_GCC>"
+    },
+    {
+      "url": "https://ftp.gnu.org/gnu/gmp/gmp-6.2.1.tar.xz",
+      "sha256": "<SHA256_GMP>"
+    },
+    {
+      "url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz",
+      "sha256": "<SHA256_MPFR>"
+    },
+    {
+      "url": "https://ftp.gnu.org/gnu/mpc/mpc-1.2.1.tar.gz",
+      "sha256": "<SHA256_MPC>"
+    },
+    {
+      "url": "https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.25.tar.xz",
+      "sha256": "<SHA256_ISL>"
+    }
+  ],
+  "build": [
+    "set -e",
+    "export PATH=\"/usr/bin:$PATH\"",
+    "mkdir -p build",
+    "cd build",
+    "../configure --prefix=/usr --enable-languages=c --disable-multilib --disable-bootstrap --with-system-zlib",
+    "make -j${JOBS:-1}"
+  ],
+  "install": [
+    "set -e",
+    "cd build",
+    "make DESTDIR=${DESTDIR:-/tmp/ibuild_install} install"
+  ],
+  "hooks": {
+    "post_fetch": [
+      "echo '-> Preparando libs internas para GCC...'",
+      "tar -xf gmp-*.tar.* && mv gmp-* gcc-*/gmp",
+      "tar -xf mpfr-*.tar.* && mv mpfr-* gcc-*/mpfr",
+      "tar -xf mpc-*.tar.* && mv mpc-* gcc-*/mpc",
+      "tar -xf isl-*.tar.* && mv isl-* gcc-*/isl"
+    ]
+  },
+  "provides": ["gcc", "cc"],
+  "_meta_notes": "Este meta baixa e embute GMP, MPFR, MPC, ISL dentro da árvore do GCC para compilar tudo junto."
+}
