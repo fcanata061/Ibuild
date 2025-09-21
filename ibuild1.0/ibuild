@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import sys, os
+"""
+ibuild - wrapper para o CLI principal
+"""
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, BASE_DIR)
+import sys
+import os
 
-import cli
+# diretório onde está o código real
+LIB_DIR = "/usr/lib/ibuild1.0"
+
+if LIB_DIR not in sys.path:
+    sys.path.insert(0, LIB_DIR)
+
+try:
+    import cli
+except ImportError as e:
+    sys.stderr.write(f"[ibuild] ERRO: não foi possível importar cli.py ({e})\n")
+    sys.exit(1)
 
 if __name__ == "__main__":
     sys.exit(cli.main())
