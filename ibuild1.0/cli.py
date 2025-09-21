@@ -32,7 +32,8 @@ import json
 import os
 import time
 
-from ibuild1.0.modules_py import (
+# importa dos módulos
+from modules import (
     build as build_mod,
     package as package_mod,
     upgrade as upgrade_mod,
@@ -60,10 +61,8 @@ C = {
 
 logger = log_mod.get_logger("cli")
 
-
 def color(msg: str, color: str) -> str:
     return f"{C.get(color,'')}{msg}{C['reset']}"
-
 
 def _print_json_or_plain(data, as_json: bool):
     if as_json:
@@ -78,7 +77,6 @@ def _print_json_or_plain(data, as_json: bool):
         else:
             print(data)
 
-
 def _setup_logging(verbose: bool, quiet: bool):
     if quiet:
         log_mod.set_level("error")
@@ -87,9 +85,8 @@ def _setup_logging(verbose: bool, quiet: bool):
     else:
         log_mod.set_level("info")
 
-
 # ----------------------
-# Subcomandos existentes
+# Subcomandos
 # ----------------------
 
 def cmd_build(args):
@@ -109,7 +106,6 @@ def cmd_build(args):
         print(color(f"[ERRO] Build falhou: {e}", "red"), file=sys.stderr)
         return 2
 
-
 def cmd_install(args):
     try:
         art = args.artifact
@@ -124,7 +120,6 @@ def cmd_install(args):
         print(color(f"[ERRO] Instalação falhou: {e}", "red"), file=sys.stderr)
         return 2
 
-
 def cmd_remove(args):
     try:
         ok = package_mod.remove_package(args.pkg, purge=args.purge)
@@ -135,13 +130,11 @@ def cmd_remove(args):
         print(color(f"[ERRO] Remoção falhou: {e}", "red"), file=sys.stderr)
         return 2
 
-
 def cmd_list(args):
     pkgs = package_mod.list_installed()
     for p in pkgs:
         print(f"{color(p['name'],'cyan')} {color(p.get('version','?'),'magenta')}")
     return 0
-
 
 def cmd_search(args):
     installed = package_mod.search_installed(args.pattern)
@@ -153,7 +146,6 @@ def cmd_search(args):
     for m in metas:
         print(f"{color(m['name'],'cyan')} {m.get('version','?')}")
     return 0
-
 
 def cmd_info(args):
     try:
@@ -173,7 +165,6 @@ def cmd_info(args):
         print(color(f"[ERRO] Info falhou: {e}", "red"), file=sys.stderr)
         return 2
 
-
 def cmd_logs(args):
     log_dir = config_mod.get("pkg_db")
     logs = [f for f in os.listdir(log_dir) if f.endswith(".log")]
@@ -181,7 +172,6 @@ def cmd_logs(args):
     for l in logs:
         print(color(l, "cyan"))
     return 0
-
 
 def cmd_log(args):
     log_file = os.path.join(config_mod.get("pkg_db"), f"{args.name}.log")
@@ -214,7 +204,6 @@ def cmd_log(args):
             print(f.read())
     return 0
 
-
 def cmd_pipeline(args):
     try:
         print(color("[INFO] Baixando...", "blue"))
@@ -234,11 +223,9 @@ def cmd_pipeline(args):
         print(color(f"[ERRO] Pipeline falhou: {e}", "red"), file=sys.stderr)
         return 2
 
-
-# ---------------
-# Argument parser
-# ---------------
-
+# ----------------------
+# Parser
+# ----------------------
 def build_parser():
     p = argparse.ArgumentParser(prog="ibuild", description="Ibuild - Gerenciador de pacotes")
     p.add_argument("--verbose", "-v", action="store_true")
@@ -309,7 +296,6 @@ def build_parser():
 
     return p
 
-
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -322,7 +308,6 @@ def main(argv=None):
         config_mod.set("jobs", args.jobs)
 
     return args.func(args)
-
 
 if __name__ == "__main__":
     sys.exit(main())
