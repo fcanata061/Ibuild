@@ -1,0 +1,235 @@
+Ibuild - Tutorial Completo
+=============================
+
+1. Introduão
+-------------
+O **ibuild** é um gerenciador de pacotes minimalista e flexível, capaz de compilar,
+instalar, atualizar e remover pacotes a partir de receitas definidas em arquivos `.meta`.
+Ele foi desenvolvido para permitir controle total sobre o processo de build,
+com suporte a sandbox, rollback, verificação de dependências e execução de hooks.
+
+Objetivos principais:
+- Reproduzir builds de forma consistente.
+- Suportar pipelines completos: baixar → extrair → patch → compilar → instalar.
+- Garantir rastreabilidade com logs, histórico e rollback.
+- Permitir evolução simples de pacotes por meio de `.meta`.
+
+2. Estrutura de Diretórios
+--------------------------
+Uma instalação típica do ibuild tem a seguinte árvore:
+
+Ibuild1.0/
+├── modules/            # Módulos internos do ibuild
+│   ├── config.py
+│   ├── log.py
+│   ├── utils.py
+│   ├── build.py
+│   ├── package.py
+│   ├── upgrade.py
+│   ├── rollback.py
+│   ├── sync.py
+│   ├── dependency.py
+│   ├── sandbox.py
+│   ├── meta.py
+│   └── fakeroot.py
+├── cli.py              # Interface de linha de comando
+└── ibuild              # Binário executável (wrapper para cli.py)
+
+Além disso, o ibuild utiliza diretórios de sistema:
+- /usr/ibuild/          -> repositório de arquivos .meta
+- /var/lib/ibuild/      -> base de dados de pacotes instalados
+- /var/log/ibuild/      -> logs de builds, upgrades e rollback
+- /var/cache/ibuild/    -> cache de tarballs, fontes e artefatos
+
+3. Instalação
+-------------
+1. Clone o repositório do ibuild:
+   $ git clone https://github.com/usuario/Ibuild.git
+   $ cd Ibuild/Ibuild1.0
+
+2. Torne o binário executável:
+   $ chmod +x ibuild
+
+3. Opcional: adicione ao PATH:
+   $ export PATH="$PWD:$PATH"
+
+Agora você pode executar:
+   $ ibuild --help
+
+4. Configuração inicial
+-----------------------
+O ibuild usa `config.py` para parâmetros padrão como diretórios de cache, db, logs.
+Você pode sobrescrever em tempo de execução com opções do CLI (ex: --jobs, --json, etc).
+
+5. Estrutura de um .meta
+------------------------
+Um `.meta` é um arquivo JSON que descreve como construir e instalar um pacote.
+
+Exemplo simples (hello.meta):
+{
+  "name": "hello",
+  "version": "2.12",
+  "description": "GNU Hello",
+  "category": "utils",
+  "source": {
+    "url": "https://ftp.gnu.org/gnu/hello/hello-2.12.tar.gz",
+    "sha256": "<HASH>"
+  },
+  "build": [
+    "./configure --prefix=/usr",
+    "make -j${JOBS:-1}"
+  ],
+  "install": [
+    "make DESTDIR=${DESTDIR} install"
+  ],
+  "dependencies": ["glibc"]
+}
+
+6. Comandos do CLI
+------------------
+O `cli.py` suporta os seguintes comandos:
+
+- build / b
+  Compila um pacote a partir do .meta.
+  Exemplo: ibuild build hello
+
+- install / i
+  Instala um pacote a partir de artefato ou diretamente de build.
+  Exemplo: ibuild install hello
+
+- remove / rm
+  Remove um pacote instalado.
+  Exemplo: ibuild rm hello
+
+- list / ls
+  Lista pacotes instalados.
+  Exemplo: ibuild ls
+
+- search / s
+  Procura pacotes (instalados e em .meta).
+  Exemplo: ibuild search gcc
+
+- info
+  Mostra informações detalhadas de um pacote.
+  Exemplo: ibuild info hello
+
+- verify
+  Verifica integridade de um pacote.
+  Exemplo: ibuild verify hello
+
+- repair
+  Reinstala/repara um pacote quebrado.
+  Exemplo: ibuild repair hello
+
+- sync
+  Sincroniza repositório de .meta (git pull ou rsync).
+  Exemplo: ibuild sync
+
+- sandbox / sb
+  Cria ou entra em um sandbox.
+  Exemplo: ibuild sandbox
+
+- deps
+  Resolve dependências de um pacote.
+  Exemplo: ibuild deps gcc
+
+- meta
+  Mostra .meta parseado de um pacote.
+  Exemplo: ibuild meta hello
+
+- upgrade / up
+  Atualiza pacotes para versões novas.
+  Exemplo: ibuild up
+
+- rollback / rb
+  Reverte para estado anterior.
+  Exemplo: ibuild rollback
+
+- revdep / rd
+  Verifica dependências reversas (quem depende de quem).
+  Exemplo: ibuild revdep zlib
+
+- orphan / or
+  Lista ou remove órfãos.
+  Exemplo: ibuild orphan --remove
+
+- history / h
+  Mostra histórico de operações.
+  Exemplo: ibuild history
+
+- logs
+  Lista arquivos de log disponíveis.
+  Exemplo: ibuild logs
+
+- log
+  Mostra conteúdo de um log, suporta -f (tail -f).
+  Exemplo: ibuild log build -f
+
+- pipeline / all
+  Executa todo o fluxo: baixar, extrair, aplicar patch, compilar, instalar.
+  Exemplo: ibuild pipeline hello --url https://.../hello-2.12.tar.gz
+
+7. Fluxo de uso completo
+------------------------
+Exemplo prático com GNU Hello:
+
+1. Criar arquivo hello.meta em /usr/ibuild/utils/hello/hello.meta
+2. Rodar build:
+   $ ibuild build hello
+3. Instalar:
+   $ ibuild install hello
+4. Ver logs:
+   $ ibuild log build -f
+5. Atualizar (quando sair nova versão):
+   $ ibuild up hello
+6. Se algo quebrar:
+   $ ibuild rollback
+
+8. Dicas avançadas
+------------------
+- Hooks permitem rodar scripts customizados em pontos específicos (pre/post fetch, build, install, remove).
+- O sandbox garante que builds não afetem o host diretamente.
+- O rollback permite voltar pacotes ou o sistema para estados anteriores.
+- O revdep garante que bibliotecas atualizadas não quebrem pacotes dependentes.
+
+9. Exemplo real - GCC Pass1
+---------------------------
+Um .meta para GCC Pass1 poderia embutir gmp, mpfr, mpc, isl dentro da árvore:
+
+{
+  "name": "gcc-pass1",
+  "version": "13.2.0",
+  "category": "base-devel",
+  "source": [
+    {"url": "https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz"},
+    {"url": "https://ftp.gnu.org/gnu/gmp/gmp-6.2.1.tar.xz"},
+    {"url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz"},
+    {"url": "https://ftp.gnu.org/gnu/mpc/mpc-1.2.1.tar.gz"},
+    {"url": "https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.25.tar.xz"}
+  ],
+  "hooks": {
+    "post_fetch": [
+      "tar -xf gmp-* && mv gmp-* gcc-*/gmp",
+      "tar -xf mpfr-* && mv mpfr-* gcc-*/mpfr",
+      "tar -xf mpc-* && mv mpc-* gcc-*/mpc",
+      "tar -xf isl-* && mv isl-* gcc-*/isl"
+    ]
+  },
+  "build": [
+    "mkdir -p build",
+    "cd build",
+    "../configure --prefix=/usr --enable-languages=c --disable-multilib",
+    "make -j${JOBS:-1}"
+  ],
+  "install": [
+    "cd build",
+    "make DESTDIR=${DESTDIR} install"
+  ]
+}
+
+10. Conclusão
+-------------
+O ibuild fornece uma infraestrutura poderosa para construir pacotes de forma
+reprodutível, rastreável e segura. Ao definir receitas em `.meta` e usar os
+comandos do CLI, você controla todo o ciclo de vida dos pacotes:
+construção, instalação, atualização, rollback e remoção.
