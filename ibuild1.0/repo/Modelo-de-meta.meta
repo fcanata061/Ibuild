@@ -1,0 +1,147 @@
+{
+  "name": "exemplo-pkg",
+  "version": "1.0.0",
+  "release": 1,
+  "epoch": 0,
+  "description": "Um exemplo de pacote completo demonstrando todos os campos suportados pelo ibuild.",
+  "category": "utils",
+
+  "license": "GPL-3.0-or-later",
+  "maintainer": "Fernando <dev@example.com>",
+  "homepage": "https://example.com/projeto",
+  "bugtracker": "https://example.com/projeto/issues",
+
+  "source": [
+    {
+      "url": "https://example.com/releases/exemplo-1.0.0.tar.gz",
+      "sha256": "<SHA256_AQUI>",
+      "type": "archive"
+    },
+    {
+      "url": "https://github.com/gcc-mirror/gcc.git",
+      "commit": "releases/gcc-13.2.0",
+      "type": "git"
+    },
+    {
+      "url": "https://github.com/example/libextra.git",
+      "commit": "a1b2c3d4",
+      "type": "git"
+    },
+    {
+      "url": "https://example.com/patches/fix-bug.patch",
+      "sha256": "<SHA256_PATCH>",
+      "type": "patch"
+    }
+  ],
+
+  "dependencies": [
+    "libc>=2.39",
+    "zlib",
+    "openssl<3.0"
+  ],
+
+  "optional_dependencies": [
+    "docs-tool",
+    "testsuite"
+  ],
+
+  "provides": [
+    "exemplo",
+    "exemplo-bin"
+  ],
+
+  "conflicts": [
+    "exemplo-old",
+    "exemplo-beta"
+  ],
+
+  "replaces": [
+    "exemplo-legacy"
+  ],
+
+  "build": [
+    "set -e",
+    "./configure --prefix=/usr --enable-feature-x --disable-feature-y",
+    "make -j${JOBS:-1}"
+  ],
+
+  "check": [
+    "set -e",
+    "make check || true"
+  ],
+
+  "install": [
+    "set -e",
+    "make DESTDIR=${DESTDIR} install",
+    "install -Dm644 README.md ${DESTDIR}/usr/share/doc/exemplo/README.md"
+  ],
+
+  "uninstall": [
+    "set -e",
+    "echo 'Removendo manualmente (se necessário)'"
+  ],
+
+  "hooks": {
+    "pre_fetch": [
+      "echo '-> Preparando cache para ${name}-${version}'"
+    ],
+    "post_fetch": [
+      "echo '-> Fontes baixadas: ${CACHE_DIR}'"
+    ],
+    "pre_build": [
+      "echo '-> Iniciando build com ${JOBS} threads'"
+    ],
+    "post_build": [
+      "echo '-> Build concluído com sucesso'"
+    ],
+    "pre_install": [
+      "echo '-> Preparando instalação em ${DESTDIR}'"
+    ],
+    "post_install": [
+      "echo '-> Pacote instalado em ${DESTDIR}'"
+    ],
+    "pre_remove": [
+      "echo '-> Salvando backup antes da remoção'"
+    ],
+    "post_remove": [
+      "echo '-> Pacote ${name} removido'"
+    ]
+  },
+
+  "sandbox": {
+    "enabled": true,
+    "binds": [
+      "/dev",
+      "/proc",
+      "/sys",
+      "/var/cache/ibuild"
+    ],
+    "memory_limit": "2G",
+    "cpu_limit": 2,
+    "net": false
+  },
+
+  "env": {
+    "CFLAGS": "-O2 -pipe",
+    "CXXFLAGS": "-O2 -pipe",
+    "LDFLAGS": "-Wl,-O1,--as-needed"
+  },
+
+  "tests": {
+    "runtime": [
+      "exemplo --version",
+      "exemplo --help"
+    ],
+    "integration": [
+      "echo 'rodando testes de integração'"
+    ]
+  },
+
+  "files": [
+    "/usr/bin/exemplo",
+    "/usr/lib/libexemplo.so",
+    "/usr/share/doc/exemplo"
+  ],
+
+  "_meta_notes": "Este é um exemplo demonstrativo que usa todas as opções suportadas."
+}
