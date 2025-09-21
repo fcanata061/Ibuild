@@ -1,71 +1,136 @@
 #!/usr/bin/env bash
-# modules/remove.sh - remoção de pacotes no ibuild
+# ibuild/modules/remove.sh
+# Evoluído: suporte a hooks inline no .meta + dry-run + checagem de deps
 
 set -euo pipefail
 
-source "$(dirname "$0")/utils.sh"
-source "$(dirname "$0")/hooks.sh"
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MODULE_DIR/utils.sh"
+source "$MODULE_DIR/hooks.sh"
+source "$MODULE_DIR/dependency.sh"
 
-PKG_DIR="/var/lib/ibuild/packages"
-BIN_DIR="/var/cache/ibuild/packages-bin"
-LOG_DIR="/var/log/ibuild"
-mkdir -p "$PKG_DIR" "$BIN_DIR" "$LOG_DIR"
-
+PKG_DIR="${PKG_DIR:-/var/lib/ibuild/packages}"
+BIN_DIR="${BIN_DIR:-/var/cache/ibuild/packages}"
+LOG_DIR="${LOG_DIR:-/var/log/ibuild}"
 REMOVE_LOG="$LOG_DIR/remove.log"
 
+ensure_dir "$LOG_DIR"
+
+DRY_RUN=false
+
 # ============================================================
-# Remover pacote
+# Helpers
 # ============================================================
-remove_pkg() {
-    local pkg="$1"
 
-    local metafile="$PKG_DIR/$pkg/.meta"
-    local filesfile="$PKG_DIR/$pkg/.files"
-
-    # Se não existir localmente, tenta fallback no BIN_DIR
-    if [ ! -f "$filesfile" ]; then
-        log ">> Manifesto não encontrado em $filesfile, tentando fallback..."
-        if [ -f "$BIN_DIR/$pkg.meta" ]; then
-            eval "$(grep -E '^(name|version)=' "$BIN_DIR/$pkg.meta")"
-            filesfile="$BIN_DIR/${name}-${version}.files"
-        fi
-    fi
-
-    [ -f "$filesfile" ] || { log "ERRO: Nenhum manifesto encontrado para $pkg"; exit 1; }
-
-    hooks_run_phase remove pre
-
-    log ">> Removendo pacote $pkg"
-    while read -r f; do
-        [ -z "$f" ] && continue
-
-        # Evitar remoção de diretórios críticos
-        case "$f" in
-            /|/usr|/usr/*|/bin|/bin/*|/lib|/lib/*|/etc|/etc/*)
-                log "AVISO: Ignorando arquivo crítico: $f"
-                continue
-                ;;
-        esac
-
-        if [ -f "/$f" ] || [ -L "/$f" ]; then
-            sudo rm -f "/$f"
-            echo "REMOVED: /$f" >> "$REMOVE_LOG"
-        elif [ -d "/$f" ]; then
-            sudo rmdir --ignore-fail-on-non-empty "/$f" 2>/dev/null || true
-        fi
-    done < "$filesfile"
-
-    # Limpar registro local
-    rm -rf "$PKG_DIR/$pkg"
-
-    hooks_run_phase remove post
-
-    log ">> Remoção concluída: $pkg"
+_meta_get() {
+    local meta="$1" key="$2"
+    grep -E "^${key}=" "$meta" | cut -d= -f2- || true
 }
 
-# CLI
+_hook_exec() {
+    local meta="$1" hook="$2" default_cmd="$3"
+
+    local cmd
+    cmd="$(_meta_get "$meta" "hook_${hook}")"
+
+    if [ -n "$cmd" ]; then
+        log "[hook:$hook] executando do meta"
+        eval "$cmd"
+    elif [ -n "$default_cmd" ]; then
+        log "[hook:$hook] executando padrão"
+        eval "$default_cmd"
+    fi
+}
+
+# ============================================================
+# Remove pipeline
+# ============================================================
+
 remove_main() {
     local pkg="$1"
-    shift || true
-    remove_pkg "$pkg" "$@"
+    local meta="$PKG_DIR/$pkg/$pkg.meta"
+
+    if [ ! -f "$meta" ]; then
+        err "Meta file não encontrado para $pkg"
+        exit 1
+    fi
+
+    eval "$(grep -E '^(name|version|rundep|builddep)=' "$meta" || true)"
+
+    local manifest
+    manifest="$PKG_DIR/$pkg/.files"
+
+    if [ ! -f "$manifest" ]; then
+        manifest="$(ls "$BIN_DIR"/$pkg-*.files 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [ ! -f "$manifest" ]; then
+        err "Manifesto de arquivos não encontrado para $pkg"
+        exit 1
+    fi
+
+    # --- Reverse dependency check ---
+    local revdeps
+    revdeps="$(dependency_reverse_check "$pkg")"
+    if [ -n "$revdeps" ]; then
+        warn "Pacotes dependem de $pkg: $revdeps"
+        warn "Abortando remoção."
+        exit 1
+    fi
+
+    # --- pre_remove hook ---
+    _hook_exec "$meta" pre_remove "hooks_run_phase remove pre"
+
+    # --- remove hook ---
+    _hook_exec "$meta" remove "
+        while read -r f; do
+            [ -n \"\$f\" ] || continue
+            target=\"/\${f#./}\"
+            if [ -e \"\$target\" ]; then
+                if \$DRY_RUN; then
+                    echo \"[dry-run] Removeria: \$target\"
+                else
+                    rm -rf \"\$target\"
+                    echo \"Removido: \$target\"
+                fi
+            fi
+        done < \"$manifest\"
+    "
+
+    # --- post_remove hook ---
+    _hook_exec "$meta" post_remove "hooks_run_phase remove post"
+
+    # --- limpeza final ---
+    if ! \$DRY_RUN; then
+        rm -rf "$PKG_DIR/$pkg"
+        echo "$(date '+%F %T') - Removed $pkg-$version" >> "$REMOVE_LOG"
+        ok "$pkg-$version removido"
+    else
+        ok "[dry-run] Nenhum arquivo removido"
+    fi
 }
+
+# ============================================================
+# CLI
+# ============================================================
+
+usage() {
+    echo "Uso: $0 [--dry-run] <pacote>"
+    exit 1
+}
+
+main() {
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true ;;
+            -h|--help) usage ;;
+            *) args+=("$1") ;;
+        esac
+        shift
+    done
+    [ ${#args[@]} -eq 0 ] && usage
+    remove_main "${args[0]}"
+}
+
+main "$@"
