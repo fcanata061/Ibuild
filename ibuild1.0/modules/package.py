@@ -1,13 +1,14 @@
 # package.py
 """
-Gerenciamento de pacotes instalados no Ibuild (evoluído).
+Gerenciamento de pacotes instalados no Ibuild (super evoluído).
 
-Principais recursos:
+Recursos:
 - Instalação com manifesto de arquivos
 - Remoção precisa baseada em manifesto
 - Upgrade / Reinstall
-- Verificação de integridade de artefatos e arquivos
+- Verificação de integridade (artefato + arquivos)
 - Busca e consultas no pkg_db
+- Reparação automática de pacotes quebrados
 """
 
 from __future__ import annotations
@@ -49,9 +50,6 @@ def _checksum_file(path: str, algo: str = "sha256") -> str:
     return h.hexdigest()
 
 def _extract_with_manifest(artifact_path: str, dest_dir: str) -> List[str]:
-    """
-    Extrai o tar.gz e retorna lista de arquivos extraídos (manifest).
-    """
     extracted_files = []
     with tarfile.open(artifact_path, "r:gz") as tar:
         for member in tar.getmembers():
@@ -68,12 +66,6 @@ def install_package(
     overwrite: bool = False,
     upgrade: bool = False,
 ) -> dict:
-    """
-    Instala um pacote a partir de um .tar.gz.
-    - gera manifesto de arquivos
-    - registra no pkg_db
-    - suporta overwrite e upgrade
-    """
     if not os.path.isfile(artifact_path):
         raise FileNotFoundError(f"Artefato não encontrado: {artifact_path}")
 
@@ -91,18 +83,15 @@ def install_package(
     if os.path.exists(pkg_meta_path):
         if not overwrite and not upgrade:
             raise FileExistsError(f"Pacote {name} já instalado. Use overwrite=True ou upgrade=True.")
-
         if upgrade:
             logger.info("Atualizando pacote %s", name)
             remove_package(name, purge=True)
 
-    # rollback seguro em caso de erro
     extracted_files = []
     try:
         logger.info("Instalando %s em %s", name, dest_dir)
         extracted_files = _extract_with_manifest(artifact_path, dest_dir)
 
-        # gravar manifesto
         with open(_pkg_manifest_path(name), "w", encoding="utf-8") as f:
             f.write("\n".join(extracted_files))
 
@@ -122,18 +111,12 @@ def install_package(
 
     except Exception as e:
         logger.error("Erro durante instalação de %s: %s", name, e)
-        # rollback: remover arquivos extraídos
         for f in extracted_files:
             try: os.remove(f)
             except FileNotFoundError: pass
         raise
 
 def remove_package(name: str, purge: bool = False) -> bool:
-    """
-    Remove pacote do sistema:
-    - apaga arquivos listados no manifesto
-    - remove registro do pkg_db
-    """
     meta = _load_pkg_meta(name)
     if not meta:
         logger.warn("Pacote %s não encontrado em pkg_db", name)
@@ -166,20 +149,12 @@ def list_installed() -> List[dict]:
     return sorted(pkgs, key=lambda x: x["name"])
 
 def search_installed(pattern: str) -> List[dict]:
-    """
-    Busca pacotes instalados pelo nome (substring).
-    """
     return [p for p in list_installed() if pattern in p["name"]]
 
 def query_package(name: str) -> Optional[dict]:
     return _load_pkg_meta(name)
 
 def verify_package(name: str, deep: bool = False) -> bool:
-    """
-    Verifica integridade do pacote:
-    - sha256 do artefato
-    - se deep=True, verifica todos arquivos no manifesto
-    """
     meta = _load_pkg_meta(name)
     if not meta:
         raise FileNotFoundError(f"{name} não encontrado em pkg_db")
@@ -202,10 +177,55 @@ def verify_package(name: str, deep: bool = False) -> bool:
                         return False
     return True
 
+def repair_package(name: str) -> bool:
+    """
+    Repara um pacote instalado:
+    - se arquivos faltarem, reextrai do .tar.gz
+    - se artefato estiver corrompido, aborta
+    """
+    meta = _load_pkg_meta(name)
+    if not meta:
+        logger.error("Pacote %s não está instalado", name)
+        return False
+
+    artifact = meta.get("artifact")
+    if not os.path.isfile(artifact):
+        logger.error("Artefato %s não existe — necessário rebuild", artifact)
+        return False
+
+    if _checksum_file(artifact) != meta.get("sha256"):
+        logger.error("Artefato corrompido (%s) — necessário rebuild", artifact)
+        return False
+
+    manifest_path = meta.get("manifest")
+    if not manifest_path or not os.path.isfile(manifest_path):
+        logger.error("Manifesto não encontrado para %s", name)
+        return False
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        files = f.read().splitlines()
+
+    dest_dir = meta.get("install_root") or "/usr/local"
+    restored = []
+    for fpath in files:
+        if not os.path.exists(fpath):
+            logger.warn("Restaurando %s...", fpath)
+            with tarfile.open(artifact, "r:gz") as tar:
+                try:
+                    member = tar.getmember(os.path.relpath(fpath, dest_dir))
+                    tar.extract(member, path=dest_dir)
+                    restored.append(fpath)
+                except KeyError:
+                    logger.error("Arquivo %s não encontrado no artefato", fpath)
+
+    if restored:
+        logger.info("Pacote %s reparado (%d arquivos restaurados)", name, len(restored))
+        return True
+    else:
+        logger.info("Pacote %s já íntegro, nada a reparar", name)
+        return True
+
 def who_requires(name: str) -> List[str]:
-    """
-    Quem depende de `name` (baseado nos .meta originais).
-    """
     dependents = []
     for pkg in list_installed():
         try:
