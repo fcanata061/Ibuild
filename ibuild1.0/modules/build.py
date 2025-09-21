@@ -1,25 +1,26 @@
-
 # build.py
 """
-Orquestrador de build do Ibuild.
+Orquestrador de build do Ibuild com suporte a hooks.
 
-Funcionalidades principais:
-- resolve dependências (opcional)
-- cria sandbox isolado por pacote
-- fetch de fontes (com cache)
-- extrai fontes em sandbox/build
-- aplica patches declarados em .meta
-- executa fases de build: pre-build hooks, build commands, check, install
-- empacota o resultado (tar.gz) e grava metadados em pkg_db
-- logging detalhado, rollback e opção de manter sandbox para depuração
-- parâmetros: jobs, timeout (por comando), keep_sandbox, stages a executar
+Pipeline:
+  fetch → extract → patch → build → check → install → package
+
+Hooks:
+  - pre_fetch / post_fetch
+  - pre_extract / post_extract
+  - pre_patch / post_patch
+  - pre_build / post_build
+  - pre_check / post_check
+  - pre_install / post_install
+  - pre_package / post_package
+
+Cada hook é uma lista de comandos (string ou lista) declarados em pkg_meta["hooks"].
+Executados dentro do sandbox com sandbox.run_in_sandbox().
 """
 
 from __future__ import annotations
-
 import os
 import shutil
-import tarfile
 import time
 import hashlib
 from typing import List, Optional, Tuple
@@ -31,25 +32,16 @@ from ibuild1.0.modules_py import (
     meta,
     sandbox,
     dependency,
-    sync,
 )
 
-# Exceções locais
-class BuildError(Exception):
-    pass
+# Exceções
+class BuildError(Exception): pass
+class FetchError(BuildError): pass
+class PatchError(BuildError): pass
+class InstallError(BuildError): pass
 
-class FetchError(BuildError):
-    pass
-
-class PatchError(BuildError):
-    pass
-
-class InstallError(BuildError):
-    pass
-
-# Helpers --------------------------------------------------------------------
+# Helpers ---------------------------------------------------------------
 def _artifact_name(pkg_meta: dict) -> str:
-    """Nome do artefato final: <name>-<version>.tar.gz"""
     return f"{pkg_meta['name']}-{pkg_meta.get('version','0')}.tar.gz"
 
 def _artifact_path(pkg_meta: dict) -> str:
@@ -60,8 +52,7 @@ def _artifact_path(pkg_meta: dict) -> str:
 def _pkg_db_meta_path(pkg_meta: dict) -> str:
     pkg_db = config.get("pkg_db")
     os.makedirs(pkg_db, exist_ok=True)
-    fname = f"{pkg_meta['name']}.installed.meta"
-    return os.path.join(pkg_db, fname)
+    return os.path.join(pkg_db, f"{pkg_meta['name']}.installed.meta")
 
 def _checksum_file(path: str, algo: str = "sha256") -> str:
     h = hashlib.new(algo)
@@ -70,277 +61,152 @@ def _checksum_file(path: str, algo: str = "sha256") -> str:
             h.update(chunk)
     return h.hexdigest()
 
-# Core steps -----------------------------------------------------------------
-def fetch_source(pkg_meta: dict, dest_dir: str, force: bool = False) -> str:
-    """
-    Baixa a fonte definida em pkg_meta['source'] para dest_dir.
-    source can be:
-      - string URL
-      - dict {url:..., sha256:...}
-      - git repo dict {git: url, checkout: tag/commit}
-    Retorna caminho para o arquivo baixado (ou dir para git clone).
-    """
+# Hooks ---------------------------------------------------------------
+def run_hooks(pkg_name: str, pkg_meta: dict, phase: str, cwd: Optional[str] = None):
+    hooks = pkg_meta.get("hooks", {})
+    cmds = hooks.get(phase, [])
+    if not cmds: return
+    log.info("Executando hooks %s (%d)", phase, len(cmds))
+    for cmd in cmds:
+        if isinstance(cmd, str):
+            cmd = ["bash", "-c", cmd]
+        sandbox.run_in_sandbox(pkg_name, cmd, cwd=cwd, phase=phase)
+
+# Core steps ---------------------------------------------------------------
+def fetch_source(pkg_name: str, pkg_meta: dict, dest_dir: str, force: bool = False) -> str:
     src = pkg_meta.get("source")
     if not src:
         raise FetchError("Source não definido no .meta")
-
-    ensure_dir = lambda p: os.makedirs(p, exist_ok=True)
-    ensure_dir(dest_dir)
-
-    # source can be dict or string
+    os.makedirs(dest_dir, exist_ok=True)
+    run_hooks(pkg_name, pkg_meta, "pre_fetch", cwd=dest_dir)
     if isinstance(src, str):
         url = src
-        sha = None
-        # infer filename
-        filename = os.path.basename(url.split("?")[0])
-        dest = os.path.join(dest_dir, filename)
-        return utils.download(url, dest, expected_sha256=sha)
-
-    if isinstance(src, dict):
-        # git source
+        dest = os.path.join(dest_dir, os.path.basename(url.split("?")[0]))
+        path = utils.download(url, dest)
+    elif isinstance(src, dict):
         if "git" in src:
-            git_url = src["git"]
-            checkout = src.get("checkout", "HEAD")
             clone_dir = os.path.join(dest_dir, "source_git")
             if os.path.isdir(clone_dir):
                 shutil.rmtree(clone_dir)
-            log.info("Clonando git %s @ %s", git_url, checkout)
-            utils.run(["git", "clone", "--depth", "1", "--branch", checkout, git_url, clone_dir], check=True)
-            return clone_dir
+            utils.run(["git", "clone", "--depth", "1", src["git"], clone_dir], check=True)
+            path = clone_dir
+        else:
+            url = src.get("url")
+            sha = src.get("sha256")
+            dest = os.path.join(dest_dir, os.path.basename(url.split("?")[0]))
+            path = utils.download(url, dest, expected_sha256=sha)
+    else:
+        raise FetchError("Formato de source inválido")
+    run_hooks(pkg_name, pkg_meta, "post_fetch", cwd=dest_dir)
+    return path
 
-        # http/ftp style
-        url = src.get("url")
-        sha = src.get("sha256")
-        if not url:
-            raise FetchError("Source dict inválido: sem 'url' ou 'git'")
-
-        filename = os.path.basename(url.split("?")[0])
-        dest = os.path.join(dest_dir, filename)
-        return utils.download(url, dest, expected_sha256=sha)
-
-    raise FetchError("Formato de source não suportado")
-
-def extract_source(archive_path: str, dest_dir: str) -> str:
-    """
-    Extrai tarballs para dest_dir. Se archive_path for dir (git clone), apenas retorna o dir.
-    Retorna caminho da árvore de fonte (possivelmente um subdir se o tar extrai uma pasta).
-    """
+def extract_source(pkg_name: str, pkg_meta: dict, archive_path: str, dest_dir: str) -> str:
+    run_hooks(pkg_name, pkg_meta, "pre_extract", cwd=dest_dir)
     if os.path.isdir(archive_path):
-        return archive_path
+        src_tree = archive_path
+    else:
+        utils.extract_tarball(archive_path, dest_dir)
+        entries = [e for e in os.listdir(dest_dir) if not e.startswith(".")]
+        if len(entries) == 1 and os.path.isdir(os.path.join(dest_dir, entries[0])):
+            src_tree = os.path.join(dest_dir, entries[0])
+        else:
+            src_tree = dest_dir
+    run_hooks(pkg_name, pkg_meta, "post_extract", cwd=src_tree)
+    return src_tree
 
-    # suportar tar.* via utils.extract_tarball
-    utils.extract_tarball(archive_path, dest_dir)
-
-    # detectar diretório raíz (caso o tar crie um folder)
-    entries = [e for e in os.listdir(dest_dir) if not e.startswith(".")]
-    if len(entries) == 1 and os.path.isdir(os.path.join(dest_dir, entries[0])):
-        return os.path.join(dest_dir, entries[0])
-    return dest_dir
-
-def apply_all_patches(pkg_meta: dict, src_tree: str):
-    patches = pkg_meta.get("_patches", [])
-    for p in patches:
-        if not os.path.isfile(p):
-            log.warn("Patch declarado não encontrado: %s", p)
-            continue
-        try:
+def apply_all_patches(pkg_name: str, pkg_meta: dict, src_tree: str):
+    run_hooks(pkg_name, pkg_meta, "pre_patch", cwd=src_tree)
+    for p in pkg_meta.get("_patches", []):
+        if os.path.isfile(p):
             utils.apply_patch(p, src_tree, strip=1)
-        except Exception as e:
-            log.exception("Falha ao aplicar patch %s: %s", p, e)
-            raise PatchError(f"Falha ao aplicar patch {p}: {e}")
+        else:
+            log.warn("Patch não encontrado: %s", p)
+    run_hooks(pkg_name, pkg_meta, "post_patch", cwd=src_tree)
 
-def run_build_commands_in_sandbox(pkg_name: str, pkg_meta: dict, src_tree: str,
-                                  jobs: Optional[int] = None, timeout: Optional[int] = None):
-    """
-    Executa sequencia de comandos de build conforme pkg_meta['build'] (lista de strings).
-    Cada comando é executado no sandbox/build (src_tree) via sandbox.run_in_sandbox.
-    """
-    build_cmds = pkg_meta.get("build", []) or []
-    if not build_cmds:
-        log.warn("Nenhum comando de build declarado em %s", pkg_meta['name'])
-        return
-
-    # preparar ambiente: passar JOBS como environment
+def run_build(pkg_name: str, pkg_meta: dict, src_tree: str, jobs: Optional[int] = None):
+    run_hooks(pkg_name, pkg_meta, "pre_build", cwd=src_tree)
     env = {}
-    if jobs:
-        env["MAKEFLAGS"] = f"-j{jobs}"
-        env["JOBS"] = str(jobs)
-
-    # executar cada linha
-    for line in build_cmds:
-        # permitir que build entries sejam strings (shell) ou listas (args)
-        if isinstance(line, str):
-            cmd = ["bash", "-c", line]
-        else:
-            cmd = list(line)
-
-        # usar phase=build para log
+    if jobs: env["JOBS"] = str(jobs)
+    for line in pkg_meta.get("build", []):
+        cmd = ["bash", "-c", line] if isinstance(line, str) else line
         sandbox.run_in_sandbox(pkg_name, cmd, cwd=src_tree, env=env, phase="build")
+    run_hooks(pkg_name, pkg_meta, "post_build", cwd=src_tree)
 
-def run_check_commands(pkg_name: str, pkg_meta: dict, src_tree: str):
-    checks = pkg_meta.get("check", []) or []
-    for line in checks:
-        if isinstance(line, str):
-            cmd = ["bash", "-c", line]
-        else:
-            cmd = list(line)
+def run_check(pkg_name: str, pkg_meta: dict, src_tree: str):
+    run_hooks(pkg_name, pkg_meta, "pre_check", cwd=src_tree)
+    for line in pkg_meta.get("check", []):
+        cmd = ["bash", "-c", line] if isinstance(line, str) else line
         sandbox.run_in_sandbox(pkg_name, cmd, cwd=src_tree, phase="check")
+    run_hooks(pkg_name, pkg_meta, "post_check", cwd=src_tree)
 
-def run_install_commands(pkg_name: str, pkg_meta: dict, src_tree: str):
-    installs = pkg_meta.get("install", []) or []
-    if not installs:
-        log.warn("Nenhum comando de install declarado para %s", pkg_meta['name'])
-    for line in installs:
-        if isinstance(line, str):
-            # garantir que DESTDIR seja respeitado; muitos Makefiles aceitam DESTDIR env var
-            cmd = ["bash", "-c", line]
-        else:
-            cmd = list(line)
+def run_install(pkg_name: str, pkg_meta: dict, src_tree: str):
+    run_hooks(pkg_name, pkg_meta, "pre_install", cwd=src_tree)
+    for line in pkg_meta.get("install", []):
+        cmd = ["bash", "-c", line] if isinstance(line, str) else line
         sandbox.run_in_sandbox(pkg_name, cmd, cwd=src_tree, phase="install")
+    run_hooks(pkg_name, pkg_meta, "post_install", cwd=src_tree)
 
-# Orquestra ------------------------------------------------------------------
+def package_artifact(pkg_name: str, pkg_meta: dict, sb_root: str) -> str:
+    run_hooks(pkg_name, pkg_meta, "pre_package", cwd=sb_root)
+    install_dir = os.path.join(sb_root, "install")
+    os.makedirs(install_dir, exist_ok=True)
+    artifact_path = _artifact_path(pkg_meta)
+    base_name = artifact_path[:-7]  # remove .tar.gz
+    if os.path.exists(artifact_path): os.remove(artifact_path)
+    log.info("Empacotando -> %s", artifact_path)
+    shutil.make_archive(base_name, "gztar", root_dir=install_dir)
+    # checksum + registro
+    chksum = _checksum_file(artifact_path)
+    installed_meta = {
+        "name": pkg_meta["name"],
+        "version": pkg_meta.get("version"),
+        "artifact": artifact_path,
+        "sha256": chksum,
+        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "meta_source": pkg_meta.get("_meta_path"),
+    }
+    with open(_pkg_db_meta_path(pkg_meta), "w", encoding="utf-8") as f:
+        import json; json.dump(installed_meta, f, indent=2)
+    run_hooks(pkg_name, pkg_meta, "post_package", cwd=sb_root)
+    return artifact_path
+
+# Orquestrador ---------------------------------------------------------------
 def build_package(pkg_name: str,
                   category: Optional[str] = None,
                   resolve_deps: bool = True,
-                  include_optional: bool = False,
                   jobs: Optional[int] = None,
                   keep_sandbox: bool = False,
-                  stages: Optional[List[str]] = None,
-                  force_fetch: bool = False) -> Tuple[str, dict]:
-    """
-    Pipeline principal para construir um pacote.
-    Retorna (artifact_path, pkg_meta) no sucesso.
-
-    stages: lista de fases a executar na ordem possível. Valores possíveis:
-      - fetch, extract, patch, build, check, install, package
-    """
-    stages = stages or ["fetch", "extract", "patch", "build", "check", "install", "package"]
-
-    # carregar meta
+                  stages: Optional[List[str]] = None) -> Tuple[str, dict]:
+    stages = stages or ["fetch","extract","patch","build","check","install","package"]
     pkg_meta = meta.load_meta(pkg_name, category)
-    log.info("Iniciando build para %s (%s)", pkg_meta["name"], pkg_meta.get("version"))
-
-    # opcional: resolver dependências (para garantir que deps estejam construídos antes)
-    if resolve_deps:
-        try:
-            order, metas = dependency.resolve([pkg_name], include_optional=include_optional, prefer_provided=True)
-            # order includes pkg and dependencies; garantir que todos deps já estejam construidos or note
-            log.debug("Ordem de dependências: %s", ", ".join(order))
-        except Exception as e:
-            log.warn("Falha ao resolver dependências automaticamente: %s", e)
-
-    # preparar sandbox
     sb_name = f"{pkg_meta['name']}-{pkg_meta.get('version','0')}"
-    sandbox.create_sandbox(sb_name, binds=[os.path.join(config.get("repo_dir"))], keep=keep_sandbox)
-
-    # área temporária para origem dentro do cache
+    sandbox.create_sandbox(sb_name, binds=[config.get("repo_dir")], keep=keep_sandbox)
     tmp_src_cache = os.path.join(config.get("cache_dir"), "sources", pkg_meta["name"])
     os.makedirs(tmp_src_cache, exist_ok=True)
 
-    artifact_path = _artifact_path(pkg_meta)
-    src_artifact = None
-    src_tree = None
-
+    artifact_path = None
     try:
-        # FETCH
+        src_artifact = None
+        src_tree = None
         if "fetch" in stages:
-            log.info("Fase: fetch")
-            src_artifact = fetch_source(pkg_meta, tmp_src_cache, force=force_fetch)
-            log.info("Fonte disponível em %s", src_artifact)
-
-        # EXTRACT
+            src_artifact = fetch_source(sb_name, pkg_meta, tmp_src_cache)
         if "extract" in stages:
-            log.info("Fase: extract")
-            # extrair dentro do sandbox build dir
-            sandbox_build_dir = os.path.join(sandbox.sandbox_root(sb_name), "build")
-            # garantir diretório de trabalho
-            if os.path.exists(sandbox_build_dir):
-                shutil.rmtree(sandbox_build_dir)
-            os.makedirs(sandbox_build_dir, exist_ok=True)
-
-            src_tree = extract_source(src_artifact, sandbox_build_dir)
-            log.info("Fonte extraída em %s", src_tree)
-
-        # PATCH
-        if "patch" in stages:
-            log.info("Fase: patch")
-            # patches declarados em pkg_meta["_patches"] (meta.py preenche)
-            # aplicar no src_tree
-            apply_all_patches(pkg_meta, src_tree)
-
-        # BUILD
-        if "build" in stages:
-            log.info("Fase: build")
-            run_build_commands_in_sandbox(sb_name, pkg_meta, src_tree, jobs=jobs)
-
-        # CHECK
-        if "check" in stages:
-            log.info("Fase: check")
-            run_check_commands(sb_name, pkg_meta, src_tree)
-
-        # INSTALL
-        if "install" in stages:
-            log.info("Fase: install")
-            # garantir DESTDIR em sandbox/install via sandbox._sandbox_env, handled by run_in_sandbox
-            run_install_commands(sb_name, pkg_meta, src_tree)
-
-        # PACKAGE
+            sb_build_dir = os.path.join(sandbox.sandbox_root(sb_name), "build")
+            if os.path.exists(sb_build_dir): shutil.rmtree(sb_build_dir)
+            os.makedirs(sb_build_dir, exist_ok=True)
+            src_tree = extract_source(sb_name, pkg_meta, src_artifact, sb_build_dir)
+        if "patch" in stages: apply_all_patches(sb_name, pkg_meta, src_tree)
+        if "build" in stages: run_build(sb_name, pkg_meta, src_tree, jobs=jobs)
+        if "check" in stages: run_check(sb_name, pkg_meta, src_tree)
+        if "install" in stages: run_install(sb_name, pkg_meta, src_tree)
         if "package" in stages:
-            log.info("Fase: package")
-            install_dir = os.path.join(sandbox.sandbox_root(sb_name), "install")
-            if not os.path.isdir(install_dir):
-                log.warn("Diretório de install não existe (%s), criando vazio para empacotar", install_dir)
-                os.makedirs(install_dir, exist_ok=True)
-
-            # criar tar.gz do conteúdo do install_dir
-            base_name = os.path.join(os.path.dirname(artifact_path), f"{pkg_meta['name']}-{pkg_meta.get('version','0')}")
-            # remove se existir
-            if os.path.exists(artifact_path):
-                os.remove(artifact_path)
-            log.info("Empacotando install -> %s", artifact_path)
-            shutil.make_archive(base_name, 'gztar', root_dir=install_dir)
-            # shutil.make_archive cria base_name + .tar.gz
-            packaged = f"{base_name}.tar.gz"
-            # mover para artifact_path se necessário
-            if packaged != artifact_path:
-                shutil.move(packaged, artifact_path)
-
-            # gravar checksum
-            chksum = _checksum_file(artifact_path)
-            log.info("Artefato criado: %s (sha256=%s)", artifact_path, chksum)
-
-            # gravar .installed.meta com info
-            installed_meta = {
-                "name": pkg_meta["name"],
-                "version": pkg_meta.get("version"),
-                "artifact": artifact_path,
-                "sha256": chksum,
-                "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "meta_source": pkg_meta.get("_meta_path"),
-            }
-            with open(_pkg_db_meta_path(pkg_meta), "w", encoding="utf-8") as f:
-                import json
-                json.dump(installed_meta, f, indent=2)
-
-        log.info("Build finalizado com sucesso: %s", pkg_meta["name"])
+            artifact_path = package_artifact(sb_name, pkg_meta, sandbox.sandbox_root(sb_name))
         return artifact_path, pkg_meta
-
     except Exception as e:
-        log.exception("Erro durante build de %s: %s", pkg_meta["name"], e)
-        # não sobrescrever artefato se falhou; opcionalmente manter sandbox para depuração
-        if not keep_sandbox:
-            try:
-                sandbox.destroy_sandbox(sb_name)
-            except Exception:
-                log.warn("Falha ao remover sandbox após erro")
-        raise BuildError(f"Build falhou para {pkg_meta['name']}: {e}") from e
-
+        log.exception("Erro em build de %s: %s", pkg_name, e)
+        raise BuildError(f"Falha em {pkg_name}: {e}") from e
     finally:
-        # se pediu para não manter sandbox e não houve exceção, remover
         if keep_sandbox:
-            log.info("keep_sandbox=True → mantendo sandbox %s para inspeção", sb_name)
+            log.info("Mantendo sandbox %s para depuração", sb_name)
         else:
-            try:
-                sandbox.destroy_sandbox(sb_name)
-            except Exception:
-                log.warn("Erro ao remover sandbox no finally")
+            sandbox.destroy_sandbox(sb_name)
