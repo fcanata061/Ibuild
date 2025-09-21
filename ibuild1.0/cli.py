@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-# cli.py — Ibuild CLI completo (atualizado: add update + healthcheck)
+# -*- coding: utf-8
+"""
+cli.py — CLI completo do Ibuild, com meta.create, update, healthcheck etc.
+"""
+
 from __future__ import annotations
 import argparse
 import sys
 import os
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-# importa módulos do diretório modules/
 from modules import (
     build as build_mod,
     package as package_mod,
@@ -24,7 +26,7 @@ from modules import (
     healthcheck as health_mod,
 )
 
-# ANSI colors
+# Cores ANSI
 C = {
     "reset": "\033[0m",
     "red": "\033[31m",
@@ -37,7 +39,7 @@ C = {
 }
 
 def color(text: str, col: str) -> str:
-    return f"{C.get(col,'')}{text}{C['reset']}"
+    return f"{C.get(col, '')}{text}{C['reset']}"
 
 logger = log_mod.get_logger("cli")
 
@@ -60,8 +62,9 @@ def _setup_logging(verbose: bool):
     else:
         log_mod.set_level("info")
 
+
 # -----------------------
-# Command handlers
+# Handlers de comandos
 # -----------------------
 
 def cmd_build(args):
@@ -71,7 +74,7 @@ def cmd_build(args):
             category=args.category,
             resolve_deps=not args.no_deps,
             include_optional=args.include_optional,
-            jobs=getattr(args, "jobs", None),
+            jobs=args.jobs,
             keep_sandbox=args.keep_sandbox,
         )
         print(color("[OK] Build concluída", "green"))
@@ -113,7 +116,7 @@ def cmd_list(args):
     for p in pkgs:
         name = p.get("name")
         version = p.get("version", "?")
-        print(f"{color(name,'cyan')} {color(version,'magenta')}")
+        print(f"{color(name, 'cyan')} {color(version, 'magenta')}")
     return 0
 
 def cmd_search(args):
@@ -121,10 +124,10 @@ def cmd_search(args):
     metas = meta_mod.search_meta(args.pattern)
     print(color("=== Instalados ===", "magenta"))
     for p in installed:
-        print(f"{color(p['name'],'cyan')} {p.get('version','?')}")
+        print(f"{color(p['name'], 'cyan')} {p.get('version', '?')}")
     print(color("=== Disponíveis (.meta) ===", "magenta"))
     for m in metas:
-        print(f"{color(m['name'],'cyan')} {m.get('version','?')}")
+        print(f"{color(m['name'], 'cyan')} {m.get('version', '?')}")
     return 0
 
 def cmd_info(args):
@@ -133,7 +136,7 @@ def cmd_info(args):
         inst = package_mod.query_package(args.pkg) is not None
         print(color(f"Pacote: {m['name']} {m.get('version','?')}", "cyan"))
         print(color("Status: instalado", "green") if inst else color("Status: não instalado", "yellow"))
-        print(f"Descrição: {m.get('description', '(sem descrição)')}")
+        print(f"Descrição: {m.get('description','(sem descrição)')}")
         print(f"Categoria: {m.get('category','?')}")
         print("Dependências:", m.get("dependencies", []))
         print("Optional:", m.get("optional_dependencies", []))
@@ -143,7 +146,6 @@ def cmd_info(args):
         return 2
 
 def cmd_verify(args):
-    # integra com modules.healthcheck
     fix = args.fix
     report = health_mod.healthcheck(autofix=fix)
     health_mod.generate_report(report)
@@ -172,7 +174,6 @@ def cmd_verify(args):
                 print(f"  {l['path']} -> {l['target']}")
                 if l.get("fixed"):
                     print(color("    🔧 Corrigido: link removido", "blue"))
-        # exit code 1 indicates problems found
         return 1
 
 def cmd_logs(args):
@@ -219,43 +220,34 @@ def cmd_log(args):
     return 0
 
 def cmd_update(args):
-    """
-    Executa modules.update.main(), gera report e apresenta resumo.
-    --no-notify : não enviar notify-send
-    --bar : imprime "updates/total" (útil para status bars)
-    """
-    # run the module (which will generate the OUTPUT files and notifications by default)
+    # executa módulo update
     try:
-        # allow update_mod to accept options if implemented; else call main()
         if hasattr(update_mod, "main"):
+            # se update_mod suporta opções, ele pode respeitar args
             update_mod.main()
         else:
-            # fallback: try run_update()
             update_mod.run_update()
     except Exception as e:
         print(color(f"[ERRO] Falha ao executar update: {e}", "red"), file=sys.stderr)
         return 2
 
-    # read the standard output JSON if exists
-    output_json = getattr(update_mod, "OUTPUT_JSON", "/var/lib/ibuild/updates.json")
-    if os.path.isfile(output_json):
+    # ler relatório JSON, se existir
+    output_json = getattr(update_mod, "OUTPUT_JSON", None)
+    data = None
+    if output_json and os.path.isfile(output_json):
         try:
             with open(output_json, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception as e:
-            print(color(f"[ERRO] Falha ao ler relatório de update: {e}", "red"), file=sys.stderr)
+            print(color(f"[ERRO] Falha ao ler relatório update: {e}", "red"), file=sys.stderr)
             return 2
-    else:
-        print(color("[WARN] Relatório de atualização não encontrado.", "yellow"))
-        data = None
 
     if args.bar:
-        # print counts in a compact form for status bar: "updates/total" or "0/0" if unknown
         if data and "summary" in data:
             s = data["summary"]
             print(f"{s.get('updates',0)}/{s.get('total',0)}")
         else:
-            # try to compute from packages list
+            # fallback
             if data and "packages" in data:
                 total = len(data["packages"])
                 updates = sum(1 for p in data["packages"] if p.get("latest") and p.get("latest") != p.get("current"))
@@ -264,7 +256,6 @@ def cmd_update(args):
                 print("0/0")
         return 0
 
-    # Default pretty output
     if data:
         summary = data.get("summary", {})
         print(color("=== Update Summary ===", "magenta"))
@@ -273,14 +264,26 @@ def cmd_update(args):
         print(f"Up-to-date: {summary.get('up_to_date', '?')}")
         if summary.get("updates", 0) > 0:
             print(color("Pacotes com novas versões:", "yellow"))
-            packs = data.get("packages", [])
-            for p in packs:
+            for p in data.get("packages", []):
                 if p.get("latest") and p.get("latest") != p.get("current"):
                     print(f" - {color(p['name'],'cyan')}: {p['current']} -> {color(p['latest'],'green')}")
         return 0
 
     print(color("[WARN] Sem dados de atualização para mostrar.", "yellow"))
     return 0
+
+def cmd_meta_create(args):
+    # args: pkg_name, category
+    try:
+        pkg_dir = meta_mod.create_meta(pkg_name=args.pkg, category=args.category,
+                                       version=args.version or "1.0.0",
+                                       maintainer=args.maintainer or "unknown",
+                                       description=args.description or "")
+        print(color(f"[OK] Meta criado em {pkg_dir}", "green"))
+        return 0
+    except Exception as e:
+        print(color(f"[ERRO] Não foi possível criar meta: {e}", "red"), file=sys.stderr)
+        return 2
 
 def cmd_pipeline(args):
     try:
@@ -290,8 +293,7 @@ def cmd_pipeline(args):
             extracted = utils.extract_archive(src, dest_dir=args.dest or "/tmp")
             if args.patch:
                 utils.apply_patch(extracted, args.patch)
-            # if pkg is given we still call build on the meta entry
-        artifact, meta = build_mod.build_package(args.pkg, category=args.category, resolve_deps=True, include_optional=False, jobs=getattr(args,'jobs',None))
+        artifact, meta = build_mod.build_package(args.pkg, category=args.category, resolve_deps=True, include_optional=False, jobs=args.jobs)
         package_mod.install_package(artifact, dest_dir=args.dest or None, overwrite=True, upgrade=args.upgrade)
         print(color("[OK] Pipeline concluído", "green"))
         return 0
@@ -300,16 +302,17 @@ def cmd_pipeline(args):
         return 2
 
 # -----------------------
-# Argument parser
+# Parser
 # -----------------------
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="ibuild", description="Ibuild - Gerenciador de pacotes")
-    p.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
-    p.add_argument("--json", action="store_true", help="JSON output")
+    p = argparse.ArgumentParser(prog="ibuild", description="Ibuild CLI atualizado com meta.create, update e healthcheck")
+    p.add_argument("--verbose", "-v", action="store_true", help="Modo verboso")
+    p.add_argument("--json", action="store_true", help="Saída JSON (quando aplicável)")
     sub = p.add_subparsers(dest="command")
 
-    sb = sub.add_parser("build", aliases=["b"], help="Build a package from .meta")
+    # build
+    sb = sub.add_parser("build", aliases=["b"], help="Compilar pacote")
     sb.add_argument("pkg")
     sb.add_argument("--category", default=None)
     sb.add_argument("--no-deps", action="store_true")
@@ -318,7 +321,8 @@ def build_parser():
     sb.add_argument("--keep-sandbox", action="store_true")
     sb.set_defaults(func=cmd_build)
 
-    si = sub.add_parser("install", aliases=["i"], help="Install artifact or package")
+    # install
+    si = sub.add_parser("install", aliases=["i"], help="Instalar pacote ou artefato")
     si.add_argument("pkg", nargs="?")
     si.add_argument("--artifact", "-a", default=None)
     si.add_argument("--category", default=None)
@@ -327,63 +331,86 @@ def build_parser():
     si.add_argument("--upgrade", action="store_true")
     si.set_defaults(func=cmd_install)
 
-    sr = sub.add_parser("remove", aliases=["rm"], help="Remove installed package")
+    # remove
+    sr = sub.add_parser("remove", aliases=["rm"], help="Remover pacote instalado")
     sr.add_argument("pkg")
     sr.add_argument("--purge", action="store_true")
     sr.set_defaults(func=cmd_remove)
 
-    sl = sub.add_parser("list", aliases=["ls"], help="List installed packages")
+    # list
+    sl = sub.add_parser("list", aliases=["ls"], help="Listar pacotes instalados")
     sl.set_defaults(func=cmd_list)
 
-    ss = sub.add_parser("search", aliases=["s"], help="Search packages")
+    # search
+    ss = sub.add_parser("search", aliases=["s"], help="Buscar pacotes")
     ss.add_argument("pattern")
     ss.set_defaults(func=cmd_search)
 
-    si2 = sub.add_parser("info", help="Show package info")
+    # info
+    si2 = sub.add_parser("info", help="Informações de um pacote")
     si2.add_argument("pkg")
     si2.add_argument("--category", default=None)
     si2.set_defaults(func=cmd_info)
 
-    sv = sub.add_parser("verify", help="Health check (integrity). Use --fix to attempt repairs")
-    sv.add_argument("--fix", "-f", action="store_true", help="Attempt automatic fixes")
+    # verify / healthcheck
+    sv = sub.add_parser("verify", aliases=["check"], help="Verificar integridade do sistema")
+    sv.add_argument("--fix", "-f", action="store_true", help="Tentar corrigir automaticamente")
     sv.set_defaults(func=cmd_verify)
 
-    slog = sub.add_parser("logs", help="List log files")
+    # meta create
+    smc = sub.add_parser("meta-create", aliases=["mcreate"], help="Criar novo pacote .meta")
+    smc.add_argument("pkg", help="Nome do pacote")
+    smc.add_argument("category", help="Categoria do pacote")
+    smc.add_argument("--version", "-v", help="Versão inicial", default="1.0.0")
+    smc.add_argument("--maintainer", "-m", help="Nome do mantenedor", default=None)
+    smc.add_argument("--description", "-d", help="Descrição", default=None)
+    smc.set_defaults(func=cmd_meta_create)
+
+    # logs
+    slog = sub.add_parser("logs", help="Listar arquivos de log")
     slog.set_defaults(func=cmd_logs)
 
-    slg = sub.add_parser("log", help="Show specific log (with --follow)")
-    slg.add_argument("name")
-    slg.add_argument("--follow", "-f", action="store_true")
+    # log
+    slg = sub.add_parser("log", help="Mostrar log específico")
+    slg.add_argument("name", help="Nome do log (ex: build, rollback)")
+    slg.add_argument("--follow", "-f", action="store_true", help="Seguir em tempo real")
     slg.set_defaults(func=cmd_log)
 
-    sup = sub.add_parser("update", aliases=["upd"], help="Scan repository for newer upstream versions and notify")
-    sup.add_argument("--no-notify", action="store_true", help="Do not send desktop notification")
-    sup.add_argument("--bar", action="store_true", help="Print 'updates/total' for status bars")
+    # update
+    sup = sub.add_parser("update", aliases=["upd"], help="Buscar novas versões upstream nos pacotes")
+    sup.add_argument("--no-notify", action="store_true", help="Não enviar notificação")
+    sup.add_argument("--bar", action="store_true", help="Imprimir updates/total para status bar")
     sup.set_defaults(func=cmd_update)
 
-    su = sub.add_parser("upgrade", aliases=["up"], help="Upgrade a package (resolve, build, install)")
+    # upgrade
+    su = sub.add_parser("upgrade", aliases=["up"], help="Atualizar pacote")
     su.add_argument("pkg")
     su.set_defaults(func=lambda args: (upgrade_mod.upgrade_package(args.pkg, commit=True), 0)[1])
 
-    srb = sub.add_parser("rollback", aliases=["rb"], help="Rollback last or a specific package")
+    # rollback
+    srb = sub.add_parser("rollback", aliases=["rb"], help="Reverter operação ou pacote")
     srb.add_argument("--last", action="store_true")
     srb.add_argument("--pkg", default=None)
     srb.add_argument("--version", default=None)
     srb.set_defaults(func=lambda args: (rollback_mod.rollback_pkg_to_version(args.pkg, args.version, commit=True) if not args.last else rollback_mod.rollback_last(commit=True), 0)[1])
 
-    srd = sub.add_parser("revdep", aliases=["rd"], help="Reverse dependency check / fix")
+    # revdep
+    srd = sub.add_parser("revdep", aliases=["rd"], help="Checar e reparar dependências inversas")
     srd.add_argument("--fix", action="store_true")
     srd.set_defaults(func=lambda args: (rollback_mod.revdep_fix(fix=args.fix, dry_run=not args.fix), 0)[1])
 
-    sor = sub.add_parser("orphan", aliases=["or"], help="Detect/remove orphan packages")
+    # orphan
+    sor = sub.add_parser("orphan", aliases=["or"], help="Detectar / remover pacotes órfãos")
     sor.add_argument("--force", action="store_true")
     sor.set_defaults(func=lambda args: (rollback_mod.remove_orphans(dry_run=False, force=args.force), 0)[1])
 
-    sh = sub.add_parser("history", aliases=["h"], help="Show rollback/upgrade history")
-    sh.add_argument("--n", type=int, default=50)
+    # history
+    sh = sub.add_parser("history", aliases=["h"], help="Mostrar histórico de operações")
+    sh.add_argument("--n", "-n", type=int, default=50, help="Número de entradas")
     sh.set_defaults(func=lambda args: (rollback_mod.history(n=args.n), 0)[1])
 
-    sp = sub.add_parser("pipeline", aliases=["all"], help="Fetch → patch → build → install pipeline")
+    # pipeline / all
+    sp = sub.add_parser("pipeline", aliases=["all"], help="Pipeline: baixar → extrair → patch → build → instalar")
     sp.add_argument("pkg")
     sp.add_argument("--url", default=None)
     sp.add_argument("--patch", default=None)
@@ -403,10 +430,8 @@ def main(argv=None):
 
     _setup_logging(getattr(args, "verbose", False))
     result = args.func(args)
-    # if handler returned an int exit code, use it
     if isinstance(result, int):
         sys.exit(result)
-    # some lambdas used above return tuple; ensure exit 0
     sys.exit(0)
 
 if __name__ == "__main__":
