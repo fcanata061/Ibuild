@@ -1,108 +1,127 @@
 #!/usr/bin/env bash
-# modules/build.sh - construção de pacotes no ibuild com sandbox
+# ibuild/modules/build.sh
+# Evolução: suporte completo a hooks inline no .meta
 
 set -euo pipefail
 
-source "$(dirname "$0")/utils.sh"
-source "$(dirname "$0")/hooks.sh"
-source "$(dirname "$0")/sandbox.sh"
+MODULE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$MODULE_DIR/utils.sh"
+source "$MODULE_DIR/sandbox.sh"
+source "$MODULE_DIR/hooks.sh"
 
-PKG_DIR="/var/lib/ibuild/packages"
-SRC_CACHE="/var/cache/ibuild/sources"
-BIN_DIR="/var/cache/ibuild/packages-bin"
-mkdir -p "$PKG_DIR" "$SRC_CACHE" "$BIN_DIR"
+PKG_DIR="${PKG_DIR:-/var/lib/ibuild/packages}"
+BUILD_ROOT="${BUILD_ROOT:-/var/cache/ibuild/build}"
+DESTDIR="${DESTDIR:-/var/cache/ibuild/dest}"
+PKG_OUT="${PKG_OUT:-/var/cache/ibuild/packages}"
+
+ensure_dir "$BUILD_ROOT" "$DESTDIR" "$PKG_OUT"
 
 # ============================================================
-# Aplicar patches (rodando dentro do sandbox)
+# Helpers
 # ============================================================
-apply_patches() {
-    local pkg="$1"
-    local srcdir="/build/$pkg"
-    local patches=("$srcdir/patches"/*.patch)
 
-    [ -d "$srcdir/patches" ] || return 0
+_meta_get() {
+    local meta="$1" key="$2"
+    grep -E "^${key}=" "$meta" | cut -d= -f2- || true
+}
 
-    for patch in "${patches[@]}"; do
-        [ -f "$patch" ] || continue
-        log ">> Aplicando patch: $(basename "$patch")"
-        (cd "$srcdir" && patch -p1 < "$patch")
-    done
+_hook_exec() {
+    local meta="$1" hook="$2" default_cmd="$3"
+
+    # hooks no .meta têm prioridade
+    local cmd
+    cmd="$(_meta_get "$meta" "hook_${hook}")"
+
+    if [ -n "$cmd" ]; then
+        log "[hook:$hook] executando comando do meta"
+        sandbox_exec bash -c "$cmd"
+    elif [ -n "$default_cmd" ]; then
+        log "[hook:$hook] executando comando padrão"
+        sandbox_exec bash -c "$default_cmd"
+    fi
 }
 
 # ============================================================
-# Construção principal
+# Build pipeline
 # ============================================================
-build_pkg() {
-    local pkg="$1"
-    local metafile="$PKG_DIR/$pkg/.meta"
 
-    [ -f "$metafile" ] || { log "ERRO: .meta não encontrado para $pkg"; exit 1; }
-
-    # Carrega .meta
-    local name version source checksum build rundep builddep
-    eval "$(grep -E '^(name|version|source|checksum|build|rundep|builddep)=' "$metafile")"
-
-    local srcfile="$SRC_CACHE/${source##*/}"
-    local workdir="$PKG_DIR/$pkg"
-    local pkgfile="$BIN_DIR/${name}-${version}.tar.zst"
-
-    hooks_run_phase build pre
-
-    # ========================================================
-    # 1. Preparar sandbox
-    # ========================================================
-    sandbox_prepare_rootfs "$pkg" --bind-ro "/usr:/hostusr,/lib:/hostlib"
-    rm -rf "$workdir" && mkdir -p "$workdir"
-    tar -xf "$srcfile" -C "$workdir" --strip-components=1
-    sandbox_copy_source "$pkg" "$workdir"
-
-    hooks_run_phase sandbox pre
-
-    # ========================================================
-    # 2. Executar build dentro do sandbox
-    # ========================================================
-    sandbox_exec "$pkg" -- bash -c "
-        set -e
-        cd /build/$pkg
-        echo '[sandbox] Aplicando patches...'
-        $(declare -f apply_patches)
-        apply_patches '$pkg'
-        echo '[sandbox] Iniciando build...'
-        $build
-        echo '[sandbox] Instalando em DESTDIR=/package'
-        make install DESTDIR=/package
-    "
-
-    hooks_run_phase sandbox post
-
-    # ========================================================
-    # 3. Empacotar resultado
-    # ========================================================
-    log '>> Empacotando resultado'
-    (cd "$SANDBOX_BASE/$pkg/package" && sudo tar -c . | zstd -19 -T0 > "$pkgfile")
-
-    # Gerar manifesto de arquivos
-    local manifest="$BIN_DIR/${name}-${version}.files"
-    sudo tar -tf "$pkgfile" | sort > "$manifest"
-
-    # Copiar .meta
-    cp "$metafile" "$BIN_DIR/${name}-${version}.meta"
-
-    # ========================================================
-    # 4. Limpar sandbox
-    # ========================================================
-    sandbox_destroy "$pkg"
-
-    hooks_run_phase build post
-
-    log ">> Build de $name-$version finalizado"
-    log "   Pacote: $pkgfile"
-    log "   Manifesto: $manifest"
-}
-
-# CLI
 build_main() {
     local pkg="$1"
-    shift || true
-    build_pkg "$pkg" "$@"
+    local pkg_path="$PKG_DIR/$pkg"
+    local meta="$pkg_path/$pkg.meta"
+
+    if [ ! -f "$meta" ]; then
+        err "Meta file não encontrado para $pkg"
+        exit 1
+    fi
+
+    # Carrega variáveis principais do .meta
+    eval "$(grep -E '^(name|version|source|checksum|build|rundep|builddep)=' "$meta" || true)"
+
+    # Define diretórios
+    export SRC_DIR="$BUILD_ROOT/$pkg/src"
+    export BUILD_DIR="$BUILD_ROOT/$pkg/build"
+    export PKG_DESTDIR="$DESTDIR/$pkg"
+
+    ensure_dir "$SRC_DIR" "$BUILD_DIR" "$PKG_DESTDIR"
+
+    # --- Fetch ---
+    _hook_exec "$meta" pre_fetch ""
+    _hook_exec "$meta" fetch "
+        if [ -n \"\$source\" ]; then
+            fname=\$(basename \"\$source\")
+            log \"Baixando fonte \$source\"
+            curl -L -o \"$BUILD_ROOT/$pkg/\$fname\" \"\$source\" || true
+            if [ -f \"$BUILD_ROOT/$pkg/\$fname\" ]; then
+                tar -xf \"$BUILD_ROOT/$pkg/\$fname\" -C \"$SRC_DIR\" --strip-components=1
+            fi
+        fi
+    "
+    _hook_exec "$meta" post_fetch ""
+
+    # --- Patch ---
+    _hook_exec "$meta" pre_patch ""
+    _hook_exec "$meta" patch "
+        if [ -d \"$pkg_path/patches\" ]; then
+            for p in \"$pkg_path\"/patches/*.patch; do
+                [ -f \"\$p\" ] || continue
+                log \"Aplicando patch \$p\"
+                patch -d \"$SRC_DIR\" -p1 < \"\$p\"
+            done
+        fi
+    "
+    _hook_exec "$meta" post_patch ""
+
+    # --- Configure ---
+    _hook_exec "$meta" pre_configure "mkdir -p \"$BUILD_DIR\""
+    _hook_exec "$meta" configure "
+        cd \"$BUILD_DIR\"
+        \"$SRC_DIR/configure\" --prefix=/usr
+    "
+    _hook_exec "$meta" post_configure ""
+
+    # --- Build ---
+    _hook_exec "$meta" pre_build ""
+    _hook_exec "$meta" build "
+        make -C \"$BUILD_DIR\" -j\$(nproc)
+    "
+    _hook_exec "$meta" post_build ""
+
+    # --- Install ---
+    _hook_exec "$meta" pre_install ""
+    _hook_exec "$meta" install "
+        make -C \"$BUILD_DIR\" DESTDIR=\"$PKG_DESTDIR\" install
+    "
+    _hook_exec "$meta" post_install ""
+
+    # --- Package ---
+    log "Empacotando $pkg-$version"
+    (
+        cd "$PKG_DESTDIR"
+        tar -c . | zstd -19 -o "$PKG_OUT/$pkg-$version.tar.zst"
+        find . -type f | sort > "$PKG_OUT/$pkg-$version.files"
+        cp "$meta" "$PKG_OUT/$pkg-$version.meta"
+    )
+
+    ok "$pkg-$version construído, instalado e empacotado em $PKG_OUT"
 }
