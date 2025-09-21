@@ -1,0 +1,461 @@
+# cli.py
+"""
+Command line interface for Ibuild.
+
+Features:
+- Subcommands: build, install, remove, list, search, verify, repair, sync, sandbox, deps, meta,
+  upgrade, rollback, revdep, orphan, history
+- Global flags: --verbose / --quiet, --json, --jobs, --keep-sandbox, --dry-run
+- Structured JSON output when --json is used
+- Integrates with modules: build, package, upgrade, rollback, sync, dependency, meta, sandbox, package, log
+- Exit codes:
+    0 - success
+    1 - usage/args error
+    2 - runtime error (command failed)
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import json
+import textwrap
+from typing import Any, Dict, List, Optional
+
+from ibuild1.0.modules_py import (
+    build as build_mod,
+    package as package_mod,
+    upgrade as upgrade_mod,
+    rollback as rollback_mod,
+    sync as sync_mod,
+    dependency as dep_mod,
+    meta as meta_mod,
+    sandbox as sb_mod,
+    log as log_mod,
+    config as config_mod,
+    fakeroot as fr_mod,
+)
+
+logger = log_mod.get_logger("cli")
+
+
+def _print_json_or_plain(data: Any, as_json: bool):
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        # Pretty print minimal friendly text
+        if isinstance(data, dict):
+            for k, v in data.items():
+                print(f"{k}: {v}")
+        elif isinstance(data, list):
+            for it in data:
+                print(it)
+        else:
+            print(data)
+
+
+def _setup_logging(verbose: bool, quiet: bool):
+    if quiet:
+        log_mod.set_level("error")
+    elif verbose:
+        log_mod.set_level("debug")
+    else:
+        log_mod.set_level("info")
+
+
+def cmd_build(args: argparse.Namespace):
+    try:
+        artifact, meta = build_mod.build_package(
+            args.pkg,
+            category=args.category,
+            resolve_deps=not args.no_deps,
+            include_optional=args.include_optional,
+            jobs=args.jobs,
+            keep_sandbox=args.keep_sandbox,
+            stages=None,
+        )
+        out = {"status": "ok", "artifact": artifact, "pkg": meta["name"], "version": meta.get("version")}
+        _print_json_or_plain(out, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("build failed: %s", e)
+        if args.json:
+            _print_json_or_plain({"status": "error", "error": str(e)}, True)
+        else:
+            print(f"ERROR: build failed: {e}", file=sys.stderr)
+        return 2
+
+
+def cmd_install(args: argparse.Namespace):
+    try:
+        # If user passed a package name, attempt to find artifact in cache; if path exists, treat as artifact
+        art = args.artifact or None
+        if args.pkg and not art:
+            # try to use cache artifact by convention
+            meta = meta_mod.load_meta(args.pkg, args.category)
+            art = f"{config_mod.get('cache_dir')}/packages/{meta['name']}-{meta.get('version','0')}.tar.gz"
+        if not art:
+            raise FileNotFoundError("Nenhum artefato fornecido nem encontrado por convenção.")
+        res = package_mod.install_package(art, dest_dir=args.dest or None, overwrite=args.overwrite, upgrade=args.upgrade)
+        _print_json_or_plain({"status": "ok", "installed": res}, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("install failed: %s", e)
+        if args.json:
+            _print_json_or_plain({"status": "error", "error": str(e)}, True)
+        else:
+            print(f"ERROR: install failed: {e}", file=sys.stderr)
+        return 2
+
+
+def cmd_remove(args: argparse.Namespace):
+    try:
+        ok = package_mod.remove_package(args.pkg, purge=args.purge)
+        _print_json_or_plain({"status": "ok", "removed": ok}, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("remove failed: %s", e)
+        if args.json:
+            _print_json_or_plain({"status": "error", "error": str(e)}, True)
+        else:
+            print(f"ERROR: remove failed: {e}", file=sys.stderr)
+        return 2
+
+
+def cmd_list(args: argparse.Namespace):
+    try:
+        pkgs = package_mod.list_installed()
+        _print_json_or_plain(pkgs, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("list failed: %s", e)
+        return 2
+
+
+def cmd_search(args: argparse.Namespace):
+    try:
+        res = package_mod.search_installed(args.pattern)
+        _print_json_or_plain(res, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("search failed: %s", e)
+        return 2
+
+
+def cmd_verify(args: argparse.Namespace):
+    try:
+        ok = package_mod.verify_package(args.pkg, deep=args.deep)
+        _print_json_or_plain({"pkg": args.pkg, "ok": ok}, args.json)
+        return 0 if ok else 2
+    except Exception as e:
+        logger.exception("verify failed: %s", e)
+        return 2
+
+
+def cmd_repair(args: argparse.Namespace):
+    try:
+        ok = package_mod.repair_package(args.pkg)
+        _print_json_or_plain({"pkg": args.pkg, "repaired": ok}, args.json)
+        return 0 if ok else 2
+    except Exception as e:
+        logger.exception("repair failed: %s", e)
+        return 2
+
+
+def cmd_sync(args: argparse.Namespace):
+    try:
+        remote = args.remote or config_mod.get("repo_remote")
+        if not remote:
+            raise ValueError("Nenhum repositório remoto configurado. Use --remote or set repo_remote in config.")
+        sync_mod.sync_repo(remote, branch=args.branch or "main")
+        _print_json_or_plain({"status": "ok", "remote": remote, "branch": args.branch or "main"}, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("sync failed: %s", e)
+        return 2
+
+
+def cmd_sandbox(args: argparse.Namespace):
+    try:
+        # open interactive shell in sandbox (spawn bash)
+        sb_name = f"{args.pkg}-{args.version}" if args.pkg else args.name
+        if not sb_name:
+            print("You must provide --name or --pkg/--version to open sandbox", file=sys.stderr)
+            return 1
+        sb_mod.create_sandbox(sb_name, binds=[config_mod.get("repo_dir")], keep=True)
+        shell = args.shell or "bash"
+        logger.info("Opening shell %s in sandbox %s", shell, sb_name)
+        # spawn interactive shell inside sandbox: use sandbox.run_in_sandbox with interactive exec
+        # We won't capture output; instead use os.execvp to replace process — but simpler: call utils.run without capturing?
+        # Use fakeroot to enter; keep it simple: call subprocess to open terminal in cwd.
+        import subprocess as _sub
+        try:
+            _sub.run(["bash", "-c", f"{shell}"], cwd=sb_mod.sandbox_root(sb_name))
+        finally:
+            if not args.keep:
+                sb_mod.destroy_sandbox(sb_name)
+        return 0
+    except Exception as e:
+        logger.exception("sandbox failed: %s", e)
+        return 2
+
+
+def cmd_deps(args: argparse.Namespace):
+    try:
+        order, metas = dep_mod.resolve([args.pkg], include_optional=args.include_optional, reverse=args.reverse)
+        _print_json_or_plain({"order": order, "metas": {k: v for k, v in metas.items()}}, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("deps failed: %s", e)
+        return 2
+
+
+def cmd_meta(args: argparse.Namespace):
+    try:
+        m = meta_mod.load_meta(args.pkg, args.category)
+        _print_json_or_plain(m, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("meta failed: %s", e)
+        return 2
+
+
+def cmd_upgrade(args: argparse.Namespace):
+    try:
+        report = upgrade_mod.upgrade_package(
+            args.pkg,
+            category=args.category,
+            commit=args.commit,
+            resolve_deps=not args.no_deps,
+            include_optional=args.include_optional,
+            jobs=args.jobs,
+            keep_sandbox=args.keep_sandbox,
+            dry_run=args.dry_run,
+        )
+        _print_json_or_plain(report, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("upgrade failed: %s", e)
+        return 2
+
+
+def cmd_rollback(args: argparse.Namespace):
+    try:
+        if args.last:
+            report = rollback_mod.rollback_last(commit=args.commit, simulate_in_sandbox=not args.no_simulate, keep_sandbox=args.keep_sandbox)
+        else:
+            if not args.pkg or not args.version:
+                print("To rollback a specific pkg use: rollback --pkg <name> --version <version>", file=sys.stderr)
+                return 1
+            report = rollback_mod.rollback_pkg_to_version(args.pkg, args.version, simulate_in_sandbox=not args.no_simulate, commit=args.commit)
+        _print_json_or_plain(report, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("rollback failed: %s", e)
+        return 2
+
+
+def cmd_revdep(args: argparse.Namespace):
+    try:
+        if args.check_only:
+            report = rollback_mod.revdep_check(check_ldd=not args.no_ldd)
+        else:
+            report = rollback_mod.revdep_fix(fix=args.fix, dry_run=args.dry_run, jobs=args.jobs)
+        _print_json_or_plain(report, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("revdep failed: %s", e)
+        return 2
+
+
+def cmd_orphan(args: argparse.Namespace):
+    try:
+        if args.dry_run:
+            res = rollback_mod.orphan_dry_run()
+            _print_json_or_plain({"candidates": res}, args.json)
+            return 0
+        else:
+            report = rollback_mod.remove_orphans(dry_run=False, force=args.force)
+            _print_json_or_plain(report, args.json)
+            return 0
+    except Exception as e:
+        logger.exception("orphan failed: %s", e)
+        return 2
+
+
+def cmd_history(args: argparse.Namespace):
+    try:
+        hist = rollback_mod.history(n=args.n)
+        _print_json_or_plain(hist, args.json)
+        return 0
+    except Exception as e:
+        logger.exception("history failed: %s", e)
+        return 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ibuild", description="Ibuild package manager")
+    p.add_argument("--verbose", "-v", action="store_true", help="Verbose logging (debug)")
+    p.add_argument("--quiet", action="store_true", help="Quiet mode (errors only)")
+    p.add_argument("--json", action="store_true", help="Output JSON")
+    p.add_argument("--jobs", "-j", type=int, default=None, help="Number of parallel jobs")
+    sub = p.add_subparsers(dest="command")
+
+    # build
+    sb = sub.add_parser("build", help="Build a package from .meta")
+    sb.add_argument("pkg", help="Package name")
+    sb.add_argument("--category", help="Category for meta lookup", default=None)
+    sb.add_argument("--no-deps", action="store_true", help="Don't resolve deps")
+    sb.add_argument("--include-optional", action="store_true", help="Include optional deps")
+    sb.add_argument("--keep-sandbox", action="store_true", help="Keep sandbox after build")
+    sb.set_defaults(func=cmd_build)
+
+    # install
+    si = sub.add_parser("install", help="Install a package artifact (.tar.gz)")
+    si.add_argument("pkg", nargs="?", help="Package name to infer artifact if not provided", default=None)
+    si.add_argument("--artifact", "-a", help="Explicit artifact path (.tar.gz)")
+    si.add_argument("--dest", help="Destination root (overrides config)", default=None)
+    si.add_argument("--overwrite", action="store_true", help="Overwrite installed meta")
+    si.add_argument("--upgrade", action="store_true", help="Upgrade if already installed")
+    si.set_defaults(func=cmd_install)
+
+    # remove
+    sr = sub.add_parser("remove", help="Remove installed package")
+    sr.add_argument("pkg", help="Package name")
+    sr.add_argument("--purge", action="store_true", help="Purge files as well")
+    sr.set_defaults(func=cmd_remove)
+
+    # list
+    sl = sub.add_parser("list", help="List installed packages")
+    sl.set_defaults(func=cmd_list)
+
+    # search
+    sps = sub.add_parser("search", help="Search installed packages")
+    sps.add_argument("pattern", help="Substring to search for")
+    sps.set_defaults(func=cmd_search)
+
+    # verify
+    sv = sub.add_parser("verify", help="Verify package integrity")
+    sv.add_argument("pkg", help="Package name")
+    sv.add_argument("--deep", action="store_true", help="Deep verify (files manifest)")
+    sv.set_defaults(func=cmd_verify)
+
+    # repair
+    srp = sub.add_parser("repair", help="Repair broken package")
+    srp.add_argument("pkg", help="Package name")
+    srp.set_defaults(func=cmd_repair)
+
+    # sync
+    ss = sub.add_parser("sync", help="Sync repo of .meta")
+    ss.add_argument("--remote", help="Remote repo URL")
+    ss.add_argument("--branch", help="Branch to checkout", default=None)
+    ss.set_defaults(func=cmd_sync)
+
+    # sandbox (open shell)
+    sbox = sub.add_parser("sandbox", help="Open a shell inside a sandbox")
+    sbox.add_argument("--name", help="Explicit sandbox name")
+    sbox.add_argument("--pkg", help="Create sandbox from package name")
+    sbox.add_argument("--version", help="Version suffix for pkg sandbox")
+    sbox.add_argument("--shell", help="Shell to run", default="bash")
+    sbox.add_argument("--keep", action="store_true", help="Keep sandbox after exit")
+    sbox.set_defaults(func=cmd_sandbox)
+
+    # deps
+    sd = sub.add_parser("deps", help="Show dependency resolution order")
+    sd.add_argument("pkg", help="Package name")
+    sd.add_argument("--include-optional", action="store_true")
+    sd.add_argument("--reverse", action="store_true", help="Reverse the order")
+    sd.set_defaults(func=cmd_deps)
+
+    # meta
+    sm = sub.add_parser("meta", help="Show .meta parsed")
+    sm.add_argument("pkg", help="Package name")
+    sm.add_argument("--category", help="Category", default=None)
+    sm.set_defaults(func=cmd_meta)
+
+    # upgrade
+    su = sub.add_parser("upgrade", help="Upgrade a package (resolve, build, install)")
+    su.add_argument("pkg", help="Package name")
+    su.add_argument("--category", help="Category", default=None)
+    su.add_argument("--commit", action="store_true", help="Apply changes to system")
+    su.add_argument("--no-deps", action="store_true", help="Don't resolve deps")
+    su.add_argument("--include-optional", action="store_true")
+    su.add_argument("--keep-sandbox", action="store_true")
+    su.add_argument("--dry-run", action="store_true")
+    su.set_defaults(func=cmd_upgrade)
+
+    # rollback
+    srb = sub.add_parser("rollback", help="Rollback last or specific package")
+    srb.add_argument("--last", action="store_true", help="Rollback last snapshot")
+    srb.add_argument("--pkg", help="Package name to rollback")
+    srb.add_argument("--version", help="Target version to rollback to")
+    srb.add_argument("--commit", action="store_true", help="Apply changes to system")
+    srb.add_argument("--no-simulate", action="store_true", help="Don't simulate in sandbox")
+    srb.add_argument("--keep-sandbox", action="store_true", help="Keep sandbox for inspection")
+    srb.set_defaults(func=cmd_rollback)
+
+    # revdep
+    srd = sub.add_parser("revdep", help="Reverse dependency checking and fixing")
+    srd.add_argument("--check-only", action="store_true", help="Only check and report")
+    srd.add_argument("--fix", action="store_true", help="Attempt to fix by rebuilding/reinstalling")
+    srd.add_argument("--dry-run", action="store_true", help="Dry run for fixes")
+    srd.add_argument("--jobs", type=int, default=None)
+    srd.add_argument("--no-ldd", action="store_true", help="Don't run ldd checks")
+    srd.set_defaults(func=cmd_revdep)
+
+    # orphan
+    sor = sub.add_parser("orphan", help="Find/remove orphan packages")
+    sor.add_argument("--dry-run", action="store_true", default=True, help="By default just show candidates")
+    sor.add_argument("--force", action="store_true", help="Force removal even explicit (use with caution)")
+    sor.set_defaults(func=cmd_orphan)
+
+    # history
+    sh = sub.add_parser("history", help="Show rollback history")
+    sh.add_argument("--n", type=int, default=50, help="Number of lines")
+    sh.set_defaults(func=cmd_history)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # if no command provided, show help
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    # setup logging
+    verbose = getattr(args, "verbose", False)
+    quiet = getattr(args, "quiet", False)
+    _setup_logging(verbose, quiet)
+
+    # set jobs globally to config if provided
+    if getattr(args, "jobs", None):
+        try:
+            config_mod.set("jobs", args.jobs)
+        except Exception:
+            pass
+
+    # invoke subcommand
+    func = getattr(args, "func", None)
+    if not func:
+        print("No command handler; this is unexpected.", file=sys.stderr)
+        return 1
+
+    try:
+        return func(args)
+    except SystemExit as se:
+        raise se
+    except Exception as e:
+        logger.exception("Unhandled exception in CLI: %s", e)
+        if getattr(args, "json", False):
+            _print_json_or_plain({"status": "error", "error": str(e)}, True)
+        else:
+            print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
