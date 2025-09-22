@@ -1,0 +1,154 @@
+=====================================================
+ IBUILD - Gerenciador de Build e Pacotes
+=====================================================
+
+Este documento lista todos os comandos suportados pelo `ibuild`,
+com exemplos de uso para cada um.
+
+-----------------------------------------------------
+1. BUILD
+-----------------------------------------------------
+Compila um pacote a partir de um arquivo .meta.
+
+Exemplo:
+    ibuild build gcc --category base -j 4
+
+Opções:
+    --no-deps          Não resolver dependências
+    --include-optional Incluir dependências opcionais
+    -j, --jobs N       Número de jobs paralelos
+    --keep-sandbox     Manter diretório sandbox após build
+    --sandbox          Forçar build em sandbox
+
+-----------------------------------------------------
+2. INSTALL
+-----------------------------------------------------
+Instala um pacote a partir de um artefato (.tar.gz).
+
+Exemplo:
+    ibuild install gcc --artifact /tmp/gcc-13.2.0.tar.gz
+
+Opções:
+    --category CAT   Categoria do pacote
+    --dest DIR       Diretório de destino
+    --overwrite      Sobrescreve se já existir
+    --upgrade        Atualiza se já existir versão antiga
+
+-----------------------------------------------------
+3. REMOVE
+-----------------------------------------------------
+Remove um pacote instalado.
+
+Exemplo:
+    ibuild remove gcc
+
+Opções:
+    --purge  Remove também arquivos de configuração
+
+-----------------------------------------------------
+4. LIST
+-----------------------------------------------------
+Lista pacotes instalados.
+
+Exemplo:
+    ibuild list
+
+-----------------------------------------------------
+5. SEARCH
+-----------------------------------------------------
+Procura pacotes instalados e disponíveis (.meta).
+
+Exemplo:
+    ibuild search gcc
+
+-----------------------------------------------------
+6. INFO
+-----------------------------------------------------
+Mostra informações detalhadas de um pacote.
+
+Exemplo:
+    ibuild info gcc --category base
+
+-----------------------------------------------------
+7. VERIFY (Healthcheck)
+-----------------------------------------------------
+Verifica integridade do sistema: pacotes quebrados,
+links órfãos, dependências ausentes. Pode corrigir.
+
+Exemplo:
+    ibuild verify
+    ibuild verify --fix
+
+-----------------------------------------------------
+8. META-CREATE
+-----------------------------------------------------
+Cria automaticamente pasta e arquivo .meta para um novo pacote.
+
+Exemplo:
+    ibuild meta-create gcc base --version 13.2.0 \
+        --maintainer "Fernando" --description "GNU Compiler Collection"
+
+Resultado:
+    /usr/ibuild/base/gcc/gcc.meta
+
+-----------------------------------------------------
+9. LOGS
+-----------------------------------------------------
+Lista todos os arquivos de log.
+
+Exemplo:
+    ibuild logs
+
+-----------------------------------------------------
+10. LOG
+-----------------------------------------------------
+Mostra o conteúdo de um log. Com --follow funciona como tail -f.
+
+Exemplo:
+    ibuild log gcc
+    ibuild log gcc --follow
+
+-----------------------------------------------------
+11. UPDATE
+-----------------------------------------------------
+Checa atualizações upstream, gera resumo e notifica.
+
+Exemplo:
+    ibuild update
+    ibuild update --bar      # imprime "atualizáveis/total"
+    ibuild update --no-notify
+
+-----------------------------------------------------
+12. PIPELINE
+-----------------------------------------------------
+Executa o processo completo: baixar → extrair → patch → build → instalar.
+
+Exemplo:
+    ibuild pipeline gcc --url https://ftp.gnu.org/gnu/gcc/gcc-13.2.0.tar.xz \
+        --patch /usr/ibuild/patches/gcc-fix.patch --category base -j 4
+
+-----------------------------------------------------
+13. TOOLCHAIN
+-----------------------------------------------------
+Gerencia GCC, Kernel e toolchain (multi-versão, perfis, rollback).
+
+Exemplos:
+    ibuild toolchain --list
+    ibuild toolchain --verify
+    ibuild toolchain --set-gcc 13.2.0
+    ibuild toolchain --set-kernel 6.9.3
+    ibuild toolchain --profiles
+    ibuild toolchain --create-profile exp
+    ibuild toolchain --use-profile exp
+    ibuild toolchain --rollback
+    ibuild toolchain -j 8        # rebuild completo
+
+-----------------------------------------------------
+14. OUTROS COMANDOS POSSÍVEIS
+-----------------------------------------------------
+Dependendo da versão do projeto, podem existir:
+    - sync       (sincronizar repositório)
+    - upgrade    (atualizar pacotes)
+    - rollback   (snapshots e reversões)
+    - pack       (empacotar artefatos)
+    - install    (via fakeroot)
