@@ -54,6 +54,29 @@ Exemplo:
     ibuild list
 
 -----------------------------------------------------
+# Listar runtimes de Python
+ibuild runtime list python
+ibuild runtime list python --detailed
+
+# Instalar Ruby 3.3.1
+ibuild runtime install ruby 3.3.1
+
+# Definir Python 3.12.3 como padrão global
+ibuild runtime use python 3.12.3
+
+# Definir Node 20 como padrão só para usuário
+ibuild runtime use node 20 --user
+
+# Validar versão específica
+ibuild runtime validate java 21
+
+# Reparo automático
+ibuild runtime repair php
+
+# Diagnóstico completo
+ibuild runtime diagnose python
+
+-----------------------------------------------------
 5. SEARCH
 -----------------------------------------------------
 Procura pacotes instalados e disponíveis (.meta).
