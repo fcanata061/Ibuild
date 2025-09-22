@@ -372,6 +372,41 @@ def cmd_log(args):
             print(f.read())
         return 0
 
+def cmd_config(args):
+    """
+    ibuild config get <key>
+    ibuild config set <key> <value> [--system]
+    ibuild config list
+    ibuild config reset [--system]
+    """
+    from modules import config as cfg
+    act = args.action
+    if act == "get":
+        if not args.key:
+            print("Uso: ibuild config get <chave>")
+            return 1
+        print(cfg.get(args.key))
+        return 0
+    elif act == "set":
+        if not args.key or args.value is None:
+            print("Uso: ibuild config set <chave> <valor> [--system]")
+            return 1
+        cfg.set(args.key, args.value, system=args.system)
+        print(f"[OK] Configuração '{args.key}' definida para '{args.value}' ({'global' if args.system else 'usuário'})")
+        return 0
+    elif act == "list":
+        allcfg = cfg.all()
+        for k, v in allcfg.items():
+            print(f"{k}: {v}")
+        return 0
+    elif act == "reset":
+        cfg.reset(system=args.system)
+        print(f"[OK] Configuração restaurada para padrões {'globais' if args.system else 'de usuário'}")
+        return 0
+    else:
+        print("Ação desconhecida:", act)
+        return 1
+
 def cmd_meta_create(args):
     """
     ibuild meta-create <pkg> <category> [--version V] [--maintainer M] [--description D]
@@ -554,6 +589,14 @@ def build_parser():
     sup.add_argument("--bar", action="store_true", help="Imprimir updates/total para status bars")
     sup.add_argument("--no-notify", action="store_true", help="Não enviar notify-send")
     sup.set_defaults(func=cmd_update)
+
+    # config
+    sc = sub.add_parser("config", help="Gerenciar configuração do ibuild")
+    sc.add_argument("action", choices=["get","set","list","reset"], help="Ação sobre a configuração")
+    sc.add_argument("key", nargs="?", help="Chave da configuração")
+    sc.add_argument("value", nargs="?", help="Valor (para set)")
+    sc.add_argument("--system", action="store_true", help="Salvar/operar no config global (/etc)")
+    sc.set_defaults(func=cmd_config)
 
     # pipeline
     sp = sub.add_parser("pipeline", aliases=["all"], help="Pipeline: fetch → patch → build → install")
