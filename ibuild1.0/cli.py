@@ -407,6 +407,51 @@ def cmd_config(args):
         print("Ação desconhecida:", act)
         return 1
 
+def cmd_runtime(args):
+    """
+    Gerenciamento de runtimes (Python, Ruby, Java, Node, Go, PHP, Perl)
+    """
+    from modules import runtime
+    lang = args.language
+
+    if args.action == "list":
+        detailed = args.detailed
+        versions = runtime.list_runtimes(lang, detailed=detailed)
+        if detailed:
+            for v in versions:
+                print(f"{v['version']}  [{v['status']}] {'(default)' if v['default'] else ''}")
+        else:
+            print(" ".join(versions) if versions else f"Nenhuma versão instalada de {lang}")
+
+    elif args.action == "install":
+        runtime.install_runtime(lang, args.version)
+
+    elif args.action == "use":
+        runtime.set_default(lang, args.version, user=args.user)
+
+    elif args.action == "remove":
+        runtime.remove_runtime(lang, args.version)
+
+    elif args.action == "validate":
+        runtime.validate_runtime(lang, args.version)
+
+    elif args.action == "repair":
+        runtime.repair_runtime(lang)
+
+    elif args.action == "diagnose":
+        report = runtime.diagnose_runtime(lang)
+        print(f"\nDiagnóstico {lang}")
+        print(f"Versão default: {report['default']}")
+        for v in report["versions"]:
+            status = "OK ✅" if v["ok"] else "BROKEN ❌"
+            print(f"- {v['version']} → {status}")
+
+    else:
+        print("Uso: ibuild runtime [list|install|use|remove|validate|repair|diagnose]")
+        return 1
+
+    return 0
+
 def cmd_meta_create(args):
     """
     ibuild meta-create <pkg> <category> [--version V] [--maintainer M] [--description D]
@@ -564,6 +609,16 @@ def build_parser():
     sv = sub.add_parser("verify", aliases=["check"], help="Verificar integridade do sistema")
     sv.add_argument("--fix", "-f", action="store_true", help="Tentar corrigir problemas automaticamente")
     sv.set_defaults(func=cmd_verify)
+
+    # runtime
+    sr = sub.add_parser("runtime", help="Gerenciar runtimes (Python, Ruby, Java, Node, etc.)")
+    sr.add_argument("action", choices=["list", "install", "use", "remove", "validate", "repair", "diagnose"],
+                    help="Ação sobre a runtime")
+    sr.add_argument("language", help="Linguagem (ex: python, ruby, java, node, go, php, perl)")
+    sr.add_argument("version", nargs="?", help="Versão (quando aplicável)")
+    sr.add_argument("--user", action="store_true", help="Definir versão apenas para o usuário (não global)")
+    sr.add_argument("--detailed", action="store_true", help="Listagem detalhada com status e default")
+    sr.set_defaults(func=cmd_runtime)
 
     # meta-create
     smc = sub.add_parser("meta-create", aliases=["mcreate"], help="Criar novo pacote .meta")
