@@ -1,0 +1,43 @@
+# =====================================================
+#  Arquivo de configuração global do Ibuild
+#  Local: /etc/ibuild/config.yml
+# =====================================================
+
+# Diretórios principais
+repo_dir: /usr/ibuild
+cache_dir: /var/cache/ibuild
+pkg_db: /var/lib/ibuild/packages
+log_dir: /var/log/ibuild
+sandbox_dir: /var/lib/ibuild/sandbox
+snapshots_dir: /var/lib/ibuild/snapshots
+
+# Repositório
+repo_url: https://github.com/fcanata061/Ibuild
+
+# Fontes adicionais
+sources_dir: /var/cache/ibuild/sources
+packages_dir: /var/cache/ibuild/packages
+patches_dir: /usr/ibuild/patches
+hooks_dir: /usr/ibuild/hooks
+
+# Notificações
+notify: true
+auto_update: false
+check_interval: 3600   # em segundos (1h)
+
+# Compilação
+makeflags: -j8
+cflags: -O2 -pipe
+cxxflags: -O2 -pipe
+ldflags: -Wl,-O1
+
+# Sandbox
+sandbox_engine: bwrap
+sandbox_tmpfs: true
+
+# Toolchain
+default_gcc: 13.2.0
+default_kernel: 6.9.3
+
+# Rollback
+keep_snapshots: 5
