@@ -79,6 +79,12 @@ Exemplo:
     ibuild verify
     ibuild verify --fix
 
+------------------------------------------------------
+ibuild config list
+ibuild config get repo_dir
+ibuild config set makeflags -j8
+ibuild config reset --system
+
 -----------------------------------------------------
 8. META-CREATE
 -----------------------------------------------------
