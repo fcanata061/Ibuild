@@ -1,602 +1,764 @@
-# dependency.py (versão evoluída: busca com backtracking, heurísticas, quebra de ciclos)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Resolução avançada de dependências para Ibuild.
+modules/dependency.py — Resolver de dependências evoluído para Ibuild
 
-Principais características:
-- Formatos suportados em .meta dependencies:
-    - "pkg"
-    - "pkg==1.2.3"
-    - "pkg>=1.2"
-    - {"name":"pkg", "version":">=1.2", "optional": True}
-    - ["alt1", "alt2==2.0", {..}]  -> alternativas (qualquer uma satisfaz)
-- Supports "provides", "conflicts"
-- Usa packaging para versão quando disponível, fallback simples caso contrário.
-- Monta grafo e usa backtracking/Memo para encontrar conjunto consistente.
-- Tenta resolver ciclos: se ciclo detectado, tenta:
-    1) usar optional deps para romper;
-    2) escolher diferentes provedores;
-    3) falha com explicação detalhada.
-- API principal: resolve(pkgs, include_optional=False, prefer_provided=True, reverse=False)
+Funcionalidades principais:
+- Parsing de especificadores de versão (usa 'packaging' quando disponível)
+- Modelo PackageRequirement / PackageCandidate
+- Index persistente de "provides" (lib/virtual -> pacotes)
+- Resolução com backtracking + heurísticas (prioriza versões estáveis, providers locais)
+- Lockfile (dependency.lock.json) para reprodução das resoluções
+- Interface de diagnóstico (explain) e verbose tracing
+- Ordenação topológica final (build/install order)
+- Proteções contra explosion do espaço de busca com timeouts e limits
+- API compatível: DependencyResolver.resolve(requests) -> ResolveResult
 """
 
 from __future__ import annotations
 import os
+import json
+import time
+import shutil
+import math
+import heapq
 import logging
-from collections import defaultdict, deque, OrderedDict
-from typing import List, Dict, Tuple, Set, Optional, Any
+from dataclasses import dataclass, field
+from typing import (
+    Optional, List, Dict, Tuple, Set, Iterable, Any, Callable
+)
 
-from ibuild1.0.modules_py import meta, log as iblog, utils, sync
-
-# tentar usar packaging para version handling
+# Tenta usar packaging.version/SpecifierSet para comparações robustas
 try:
     from packaging.version import Version, InvalidVersion
     from packaging.specifiers import SpecifierSet, InvalidSpecifier
-    _HAS_PACKAGING = True
+    HAS_PACKAGING = True
 except Exception:
-    _HAS_PACKAGING = False
+    HAS_PACKAGING = False
 
-# logging local
-logger = iblog.get_logger("dependency")
+# logger local
+logger = logging.getLogger("ibuild.dependency")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO)
 
-# Erros
-class DependencyError(Exception):
-    pass
+# ---------------------------------------------------------------------
+# Helpers de versão e spec parsing
+# ---------------------------------------------------------------------
 
-class CycleError(DependencyError):
-    def __init__(self, cycle_path: List[str]):
-        super().__init__(f"Ciclo detectado: {' -> '.join(cycle_path)}")
-        self.cycle_path = cycle_path
-
-class ConflictError(DependencyError):
-    def __init__(self, reason: str):
-        super().__init__(f"Conflito: {reason}")
-        self.reason = reason
-
-# caches por execução
-_META_CACHE: Dict[str, dict] = {}
-_PROVIDES_INDEX: Dict[str, Set[str]] = {}
-
-def _load_meta_cached(pkg_name: str, category: Optional[str] = None) -> dict:
-    key = f"{category or '_'}::{pkg_name}"
-    if key in _META_CACHE:
-        return _META_CACHE[key]
-    m = meta.load_meta(pkg_name, category)
-    _META_CACHE[key] = m
-    return m
-
-def _build_provides_index(force: bool=False):
-    global _PROVIDES_INDEX
-    if _PROVIDES_INDEX and not force:
-        return
-    _PROVIDES_INDEX = defaultdict(set)
-    repo = meta.config.get("repo_dir")
-    try:
-        cats = meta.list_categories()
-    except Exception:
-        cats = []
-    for cat in cats:
-        try:
-            pkgs = meta.list_packages(cat)
-        except Exception:
-            continue
-        for p in pkgs:
-            try:
-                m = _load_meta_cached(p, cat)
-            except Exception:
-                continue
-            provs = m.get("provides", []) or []
-            for pr in provs:
-                _PROVIDES_INDEX[pr].add(p)
-    _PROVIDES_INDEX = dict(_PROVIDES_INDEX)
-
-def _version_satisfies(candidate_version: str, constraint: Optional[str]) -> bool:
-    if not constraint or constraint == "":
-        return True
-    if _HAS_PACKAGING:
-        try:
-            ver = Version(str(candidate_version))
-            spec = SpecifierSet(str(constraint))
-            return ver in spec
-        except Exception:
-            # fallback para igualdade
-            return str(candidate_version) == str(constraint)
-    else:
-        # sem packing: tratar "==" e simples comparações lexicográficas básicas
-        if "==" in constraint:
-            return str(candidate_version) == constraint.split("==",1)[1].strip()
-        # se operadores complexos, aceitar e avisar (não bloquear)
-        if any(op in constraint for op in [">=", "<=", ">", "<", "~=", "!="]):
-            logger.warn("Sem 'packaging' — constraints complexas não avaliadas, assumindo True para constraint '%s'", constraint)
-            return True
-        return str(candidate_version) == str(constraint)
-
-def _expand_dep_item(item: Any) -> List[Tuple[str, Optional[str], bool]]:
-    """
-    Aceita:
-    - str -> "pkg" ou "pkg==1.2"
-    - dict -> {"name":.., "version":.., "optional": bool}
-    - list -> alternativas: cada entry processada e retornada como alternativa
-    Retorna lista de (name, version_constraint_or_None, optional_flag)
-    Se forem alternativas (lista), cada alternativa aparece separada.
-    """
-    if isinstance(item, str):
-        # detectar operadores simples
-        if "==" in item:
-            name, ver = item.split("==",1)
-            return [(name.strip(), ver.strip(), False)]
-        for op in [">=", "<=", ">", "<", "~=", "!="]:
-            if op in item:
-                # guardar como constraint inteira (ex: ">=1.2,<2.0")
-                # buscar nome até primeiro espaço/op
-                # simplificar: separar nome pelo primeiro caractere que não seja alfanum/._- 
-                # mas aqui assumimos "name<op>..."
-                # tentar split por primeira aparição de op (pode haver composições)
-                # fallback: assume name antes do op
-                idx = item.find(op)
-                name = item[:idx].strip()
-                constraint = item[len(name):].strip()
-                return [(name, constraint, False)]
-        return [(item.strip(), None, False)]
-
-    if isinstance(item, dict):
-        name = item.get("name") or item.get("pkg") or item.get("package")
-        constraint = item.get("version") or item.get("constraint")
-        optional = bool(item.get("optional", False))
-        if not name:
-            raise DependencyError(f"Dependência dict sem 'name': {item}")
-        return [(name, constraint, optional)]
-
-    if isinstance(item, list):
-        res = []
-        for alt in item:
-            res.extend(_expand_dep_item(alt))
-        return res
-
-    raise DependencyError(f"Formato de dependência inválido: {item}")
-
-def _resolve_virtual(name: str, constraint: Optional[str]) -> Optional[Tuple[str, dict]]:
-    """
-    Para um nome virtual (provide), retorna um candidato (pkgname, meta) que satisfaça constraint.
-    Estratégia: procura providers e escolhe o de maior versão compatível.
-    """
-    if not _PROVIDES_INDEX:
-        _build_provides_index()
-    providers = _PROVIDES_INDEX.get(name, set())
-    if not providers:
+def parse_version(v: str):
+    """Tenta parsear versão com packaging, fallback para string."""
+    if not v:
         return None
-    best = None
-    best_ver = None
-    for p in providers:
+    if HAS_PACKAGING:
         try:
-            m = _load_meta_cached(p)
-        except Exception:
-            continue
-        v = str(m.get("version", "0"))
-        if _version_satisfies(v, constraint):
-            if best is None:
-                best = (p, m)
-                best_ver = v
-            else:
-                try:
-                    if _HAS_PACKAGING and Version(v) > Version(best_ver):
-                        best = (p, m); best_ver = v
-                    elif not _HAS_PACKAGING and v > best_ver:
-                        best = (p, m); best_ver = v
-                except Exception:
-                    pass
-    return best
+            return Version(v)
+        except InvalidVersion:
+            # fallback: keep raw string
+            return v
+    return v
 
-# ---------------------------
-# Backtracking resolver
-# ---------------------------
-
-def _normalize_initial(pkgs: List[str]) -> List[str]:
-    # se passar pkg@ver, separar (não usado aqui por ora). Mantemos nomes simples.
-    return list(pkgs)
-
-def _collect_all_candidates(name: str, constraint: Optional[str], prefer_provided: bool) -> List[Tuple[str, dict]]:
+def parse_specifier(spec: str):
     """
-    Retorna lista de candidatos reais para o requisito `name`.
-    1) tenta pacote literal com esse nome (se existir)
-    2) se falhar e prefer_provided=True, tenta providers (virtual)
-    3) retorna lista possivelmente vazia
+    Retorna um SpecifierSet se packaging disponível, ou uma simple callable fallback.
     """
-    candidates = []
-    try:
-        m = _load_meta_cached(name)
-        candidates.append((name, m))
-    except Exception:
-        # não existe pacote literal
-        pass
-
-    # se constraint não satisfeita pelo literal, ele será filtrado depois
-    if prefer_provided:
-        prov = _resolve_virtual(name, constraint)
-        if prov:
-            # prov é single best candidate; também varrer todos providers poderia ser mais completo.
-            candidates.append(prov)
+    if not spec:
+        return None
+    if HAS_PACKAGING:
+        try:
+            return SpecifierSet(spec)
+        except InvalidSpecifier:
+            return None
+    # fallback rudimentar: supports "==x", ">=x", "<=x", "<x", ">x"
+    ops = []
+    for part in spec.split(","):
+        part = part.strip()
+        if part.startswith("=="):
+            ops.append(("==", part[2:]))
+        elif part.startswith(">="):
+            ops.append((">=", part[2:]))
+        elif part.startswith("<="):
+            ops.append(("<=", part[2:]))
+        elif part.startswith(">"):
+            ops.append((">", part[1:]))
+        elif part.startswith("<"):
+            ops.append(("<", part[1:]))
         else:
-            # tentar listar TODOS providers (não apenas melhor) para backtracking
-            if _PROVIDES_INDEX:
-                all_provs = _PROVIDES_INDEX.get(name, set())
-                for p in all_provs:
-                    try:
-                        candidates.append((p, _load_meta_cached(p)))
-                    except Exception:
-                        continue
-    return candidates
-
-def _satisfies_conflicts(chosen_set: Set[str], candidate_name: str, candidate_meta: dict) -> Optional[str]:
-    """
-    Verifica se ao adicionar candidate_name ao conjunto chosen_set causa conflito.
-    Retorna None se ok, ou string com razão do conflito se houver.
-    Usa campo 'conflicts' nas metas.
-    """
-    # verificar conflicts do candidate contra os já escolhidos
-    for c in candidate_meta.get("conflicts", []) or []:
-        # c pode ser string/dict/list; expandir
-        for nm, _, _ in _expand_dep_item(c):
-            # se nome exato presente, conflito
-            if nm in chosen_set:
-                return f"{candidate_name} conflita com {nm}"
-            # se nm for virtual e algum chosen provide isso, também conflito
-            provs = _PROVIDES_INDEX.get(nm, set())
-            if provs & chosen_set:
-                return f"{candidate_name} conflita com provider {list(provs & chosen_set)[0]} (virtual {nm})"
-    # verificar conflicts existentes no chosen_set contra o candidate
-    for existing in list(chosen_set):
-        try:
-            m = _load_meta_cached(existing)
-        except Exception:
-            continue
-        for c in m.get("conflicts", []) or []:
-            for nm, _, _ in _expand_dep_item(c):
-                if nm == candidate_name:
-                    return f"{existing} conflita com {candidate_name}"
-                provs = _PROVIDES_INDEX.get(nm, set())
-                if candidate_name in provs:
-                    return f"{existing} conflita com provider {candidate_name} (virtual {nm})"
-    return None
-
-def _candidate_version_ok(candidate_meta: dict, constraint: Optional[str]) -> bool:
-    if not constraint:
+            ops.append(("==", part))
+    def checker(ver) -> bool:
+        # if packaging not available, compare lexicographically
+        for op, vv in ops:
+            if op == "==":
+                if str(ver) != vv: return False
+            elif op == ">=":
+                if str(ver) < vv: return False
+            elif op == "<=":
+                if str(ver) > vv: return False
+            elif op == ">":
+                if str(ver) <= vv: return False
+            elif op == "<":
+                if str(ver) >= vv: return False
         return True
-    return _version_satisfies(str(candidate_meta.get("version", "0")), constraint)
+    return checker
 
-def _gather_deps_from_meta(pkg_name: str, pkg_meta: dict, include_optional: bool) -> List[Any]:
-    """Retorna lista bruta de dependências do meta (como declaradas)"""
-    deps = pkg_meta.get("dependencies", []) or []
-    # alguns projetos usam 'depends' ou 'requires' alternativamente
-    if not deps:
-        for alt in ("depends", "requires"):
-            if alt in pkg_meta:
-                deps = pkg_meta[alt] or []
-                break
-    # filtrar optional aqui? não — manter para avaliação no resolver
-    return deps
-
-def _resolve_with_backtracking(initial: List[str],
-                               include_optional: bool = False,
-                               prefer_provided: bool = True,
-                               max_depth: int = 1000) -> Tuple[List[str], Dict[str, dict]]:
-    """
-    Algoritmo central:
-    - tentativa de construir chosen_set (set de nomes reais) que satisfaça todas dependências.
-    - trabalha em DFS: pegar próxima necessidade não satisfeita, tentar candidatos (literal + providers).
-    - usa memo (failed states) para podar.
-    - se ciclo detectado, tenta heurísticas para romper (usar optional, trocar provider).
-    Retorna (ordered_list, metas) se sucesso, ou lança DependencyError/ConflictError/CycleError.
-    """
-
-    _build_provides_index()  # garantir index
-    metas: Dict[str, dict] = {}
-    # chosen_set: pacotes reais selecionados
-    chosen_set: Set[str] = set()
-    # requirements: mapping pkg -> list of raw deps (for later expansion)
-    requirements: Dict[str, List[Any]] = {}
-
-    # prepare initial metas & queue
-    initial_norm = _normalize_initial(initial)
-    queue = deque(initial_norm)
-
-    # pre-load initial meta candidates (if virtual, will resolve later)
-    while queue:
-        name = queue.popleft()
-        # if exists literal, add to metas, else leave to resolver as virtual
-        try:
-            m = _load_meta_cached(name)
-            metas[name] = m
-        except Exception:
-            # virtual, do nothing for now
-            pass
-
-    # We'll maintain a list of "needs": each need is tuple(name, constraint, required_by, optional_flag)
-    # Start by converting initial inputs to needs (name may be virtual)
-    initial_needs: List[Tuple[str, Optional[str], Optional[str], bool]] = []
-    for name in initial_norm:
-        initial_needs.append((name, None, None, False))
-
-    # helper structures for backtracking
-    memo_failed_states: Set[str] = set()  # fingerprint of states that falharam
-    # fingerprint: sorted chosen_set + sorted remaining needs
-
-    def fingerprint(chosen: Set[str], needs: List[Tuple[str, Optional[str], Optional[str], bool]]) -> str:
-        return "|".join(sorted(chosen)) + "::" + "|".join(f"{n}:{c}:{opt}" for (n,c,_,opt) in needs)
-
-    # build function to expand needs from a chosen package
-    def expand_needs_from_pkg(name: str) -> List[Tuple[str, Optional[str], str, bool]]:
-        # returns list of (dep_name, constraint, required_by, optional_flag)
-        try:
-            m = metas.get(name) or _load_meta_cached(name)
-            metas[name] = m
-        except Exception:
-            raise DependencyError(f"Meta não encontrado para {name}")
-
-        deps_raw = _gather_deps_from_meta(name, metas[name], include_optional)
-        res = []
-        for raw in deps_raw:
-            for dep_name, constraint, optional in _expand_dep_item(raw):
-                if optional and not include_optional:
-                    continue
-                # append
-                res.append((dep_name, constraint, name, optional))
-        return res
-
-    # main DFS search
-    def dfs(needs: List[Tuple[str, Optional[str], Optional[str], bool]], chosen: Set[str], depth: int=0) -> bool:
-        if depth > max_depth:
-            raise DependencyError("Profundidade máxima de resolução atingida")
-
-        # limpar necessidades já satisfeitas
-        new_needs = []
-        for (name, constraint, req_by, optional) in needs:
-            # Se name já foi escolhido (ou provided por chosen), validar versão constraint
-            satisfied = False
-            # se name é literal e está em chosen, verificar versão
-            if name in chosen:
-                m = _load_meta_cached(name)
-                if _candidate_version_ok(m, constraint):
-                    satisfied = True
-                else:
-                    # chosen package não satisfaz constraint -> esta necessidade falha
-                    return False
-            else:
-                # se any chosen provides 'name'
-                provs = _PROVIDES_INDEX.get(name, set())
-                if provs & chosen:
-                    # verificar provider version
-                    prov_name = list(provs & chosen)[0]
-                    pm = _load_meta_cached(prov_name)
-                    if _candidate_version_ok(pm, constraint):
-                        satisfied = True
-                    else:
-                        return False
-            if not satisfied:
-                new_needs.append((name, constraint, req_by, optional))
-
-        needs = new_needs
-
-        if not needs:
-            return True  # todas satisfeitas
-
-        # fingerprint check
-        fp = fingerprint(chosen, needs)
-        if fp in memo_failed_states:
-            return False
-
-        # escolher next need — heurística: pick the one with fewest candidates (MRV)
-        best_need = None
-        best_cands = None
-        for need in needs:
-            name, constraint, req_by, optional = need
-            cands = _collect_all_candidates(name, constraint, prefer_provided=True)
-            # filtrar por version ok
-            cands = [(n,m) for (n,m) in cands if _candidate_version_ok(m, constraint)]
-            # se none e optional -> pular
-            if not cands and optional:
-                continue
-            if best_need is None or len(cands) < len(best_cands):
-                best_need = need
-                best_cands = cands
-
-        if best_need is None:
-            # nenhum candidato encontrado para necessidades não opcionais -> falha
-            # compilar mensagem de erro
-            unsat = ", ".join(f"{n}" for (n,_,_,opt) in needs if not opt)
-            memo_failed_states.add(fp)
-            raise DependencyError(f"Dependência(s) não satisfeita(s): {unsat}")
-
-        # tentar candidatos em ordem preferencial (ordenar por versão decrescente)
-        name, constraint, req_by, optional = best_need
-        cands = best_cands or []
-        # heurística: ordena por versão desc (preferir mais recente)
-        def cand_key(pair):
-            try:
-                v = str(pair[1].get("version","0"))
-                if _HAS_PACKAGING:
-                    return Version(v)
-                return v
-            except Exception:
-                return str(pair[0])
-        cands.sort(key=lambda p: cand_key(p), reverse=True)
-
-        # se houver nenhuma candidato e optional True -> pular
-        if not cands:
-            if optional:
-                # consider as satisfied by skipping
-                remaining = [x for x in needs if x != best_need]
-                return dfs(remaining, chosen, depth+1)
-            memo_failed_states.add(fp)
-            return False
-
-        # tentar cada candidato
-        for candidate_name, candidate_meta in cands:
-            # checar conflitos imediatos
-            conflict_reason = _satisfies_conflicts(chosen, candidate_name, candidate_meta)
-            if conflict_reason:
-                logger.debug("Candidato %s rejeitado por conflito: %s", candidate_name, conflict_reason)
-                continue
-
-            # adiciona candidato e expande suas próprias dependências
-            chosen.add(candidate_name)
-            # carregar suas deps
-            new_reqs = []
-            try:
-                deps_of_candidate = _gather_deps_from_meta(candidate_name, candidate_meta, include_optional)
-                for raw in deps_of_candidate:
-                    for dname, dconstraint, dopt in _expand_dep_item(raw):
-                        if dopt and not include_optional:
-                            continue
-                        new_reqs.append((dname, dconstraint, candidate_name, dopt))
-                # construir next needs: (needs - best_need) + new_reqs
-                next_needs = [n for n in needs if n != best_need] + new_reqs
-                # check cycles: if candidate is equal to req_by or candidate causes trivial cycle
-                # DFS recursion
-                ok = dfs(next_needs, chosen, depth+1)
-                if ok:
-                    return True
-            except CycleError as ce:
-                # tentativa de quebrar ciclo: se alguma dependência é optional, tentar pular
-                logger.debug("CycleError detectado ao tentar candidato %s: %s", candidate_name, ce)
-                # continuar tentando outros candidatos
-                pass
-            except DependencyError as de:
-                logger.debug("DependencyError ao expandir %s: %s", candidate_name, de)
-                # falhou, tentar próximo candidato
-                pass
-
-            # rollback
-            chosen.discard(candidate_name)
-
-        # nenhum candidato funcionou -> memoize e retornar False
-        memo_failed_states.add(fp)
+def spec_matches_version(spec, version: Optional[str]) -> bool:
+    """Testa se version satisfaz spec (SpecifierSet ou callable)."""
+    if spec is None:
+        return True
+    if version is None:
         return False
+    if HAS_PACKAGING and isinstance(spec, SpecifierSet):
+        try:
+            return parse_version(version) in spec
+        except Exception:
+            return False
+    if callable(spec):
+        return spec(version)
+    # fallback simple equality
+    return str(spec) == str(version)
 
-    # Start search
-    initial_needs = []
-    for n in initial_norm:
-        initial_needs.append((n, None, None, False))
-    success = dfs(initial_needs, chosen_set)
-    if not success:
-        raise DependencyError("Não foi possível resolver dependências com as heurísticas atuais")
+# ---------------------------------------------------------------------
+# Modelos de dados
+# ---------------------------------------------------------------------
 
-    # se sucesso, construir metas dict para todos chosen_set
-    result_metas = {}
-    for p in chosen_set:
-        result_metas[p] = _load_meta_cached(p)
+@dataclass
+class PackageCandidate:
+    """
+    Representa uma opção concreta do pacote disponível no repositório:
+      name: nome do pacote (unique id)
+      version: versão string
+      provides: lista de provides (virtuals / libs)
+      depends: lista de requirements (tuples ou strings)
+      conflicts: lista de pacotes conflitantes
+      meta: dicionário cru do .meta (opcional)
+    """
+    name: str
+    version: Optional[str] = None
+    provides: List[str] = field(default_factory=list)
+    depends: List[str] = field(default_factory=list)
+    conflicts: List[str] = field(default_factory=list)
+    optional: List[str] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
 
-    # ordenar por topo-sort (dependências primeiro)
-    # construir graph dependency->dependents para chosen_set
-    graph = defaultdict(set)
-    for p in chosen_set:
-        m = result_metas[p]
-        for raw in _gather_deps_from_meta(p, m, include_optional):
-            for dname, dconstraint, dopt in _expand_dep_item(raw):
-                # map to real chosen provider
-                if dname in chosen_set:
-                    graph[dname].add(p)
-                else:
-                    # if provided by chosen_set
-                    provs = _PROVIDES_INDEX.get(dname, set())
-                    inter = provs & chosen_set
-                    if inter:
-                        # use one provider (arbitrarily)
-                        graph[list(inter)[0]].add(p)
+    def id(self) -> str:
+        return f"{self.name}-{self.version}" if self.version else self.name
 
-    # topo sort
-    ordered = _topo_sort(graph)
+    def satisfies(self, requirement: "PackageRequirement") -> bool:
+        """Verifica se este candidate satisfaz um dado PackageRequirement."""
+        if requirement.name != self.name and requirement.name not in self.provides and requirement.name not in self.meta.get("provides", []):
+            return False
+        if requirement.specifier is None:
+            return True
+        return spec_matches_version(requirement.specifier, self.version)
 
-    # filtrar apenas chosen_set e manter ordem
-    final_order = [n for n in ordered if n in chosen_set]
+@dataclass
+class PackageRequirement:
+    """
+    Expressa uma necessidade: nome (pode ser virtual), e optional specifier string.
+    Ex: name="libfoo.so", specifier=">=1.2,<2.0"
+    """
+    name: str
+    raw: str = ""   # raw textual form
+    specifier: Optional[Any] = None  # SpecifierSet or callable
 
-    return final_order, result_metas
+    @classmethod
+    def from_string(cls, s: str) -> "PackageRequirement":
+        """Cria um PackageRequirement a partir de uma string tipo 'name>=1.2,<2.0'."""
+        s = (s or "").strip()
+        if not s:
+            raise ValueError("Empty requirement string")
+        # heurística: split first non-alpha char from name to spec
+        # but better: split at first space or first one of comparator chars
+        # try to find comparator
+        comps = ["==", ">=", "<=", ">", "<", "~=", "!="]
+        idx = None
+        for c in comps:
+            pos = s.find(c)
+            if pos != -1:
+                idx = pos
+                break
+        if idx is None:
+            # maybe 'name spec' or just 'name'
+            if " " in s:
+                parts = s.split(None, 1)
+                name = parts[0].strip()
+                spec = parts[1].strip()
+                spec_parsed = parse_specifier(spec)
+                return cls(name=name, raw=s, specifier=spec_parsed)
+            else:
+                return cls(name=s, raw=s, specifier=None)
+        # find where spec starts by scanning until comparator char occurrence
+        # fallback: separate letters/digits from others
+        # simple approach: name chars are alnum, dash, underscore, dot
+        name = ""
+        spec = ""
+        for i, ch in enumerate(s):
+            if ch.isalnum() or ch in "-_.":
+                name += ch
+            else:
+                spec = s[i:].strip()
+                break
+        spec_parsed = parse_specifier(spec)
+        return cls(name=name, raw=s, specifier=spec_parsed)
 
-# -----------------------------------------------------
-# utilitários: topo sort / ciclo detect / explain
-# -----------------------------------------------------
-def _topo_sort(graph: Dict[str, Set[str]]) -> List[str]:
-    # graph: dependency -> set(dependents)
-    indeg = defaultdict(int)
-    nodes = set()
-    for dep, depset in graph.items():
-        nodes.add(dep)
-        for d in depset:
-            nodes.add(d)
-            indeg[d] += 1
-    q = deque([n for n in nodes if indeg[n] == 0])
-    out = []
-    processed = 0
-    while q:
-        n = q.popleft()
-        out.append(n)
-        processed += 1
-        for dependent in graph.get(n, []):
-            indeg[dependent] -= 1
-            if indeg[dependent] == 0:
-                q.append(dependent)
-    if processed != len(nodes):
-        cycle = _find_cycle(nodes, graph)
-        raise CycleError(cycle)
+# ---------------------------------------------------------------------
+# Storage / index (provides index and candidate index)
+# ---------------------------------------------------------------------
+
+class RepoIndex:
+    """
+    Index simples para os pacotes disponíveis no repositório.
+
+    - candidates_by_name: name -> list[PackageCandidate] (different versions)
+    - provides_index: provide_name -> set(package_name)
+    - persistent backing (json) para provides_index e candidate metadata (light)
+    """
+
+    def __init__(self, repo_dir: Optional[str] = None, index_file: Optional[str] = None):
+        self.repo_dir = repo_dir or (os.getenv("IBUILD_REPO_DIR") or "/usr/ibuild")
+        self.index_file = index_file or os.path.join(self.repo_dir, "dependency_index.json")
+        self.candidates_by_name: Dict[str, List[PackageCandidate]] = {}
+        self.provides_index: Dict[str, Set[str]] = {}
+        self._loaded = False
+        # Try to load persistent index if present
+        self.load()
+
+def _safe_load_json(path: str) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+        # Parte 2/3 — continua RepoIndex com construção de índice e seleção
+
+# continue class RepoIndex methods
+def _candidate_from_meta(meta: Dict[str, Any], name_hint: Optional[str] = None) -> PackageCandidate:
+    """
+    Converte dicionário meta (carregado de .meta) para PackageCandidate.
+    Espera que meta contenha ao menos 'name' e opcionalmente 'version'.
+    """
+    name = meta.get("name") or name_hint or meta.get("pkg") or meta.get("package")
+    version = meta.get("version")
+    provides = meta.get("provides", []) or []
+    # normalize provides as strings
+    provides = [str(p) for p in provides]
+    depends = meta.get("depends", []) or meta.get("dependencies", []) or []
+    depends = [str(d) for d in depends]
+    optional = meta.get("optional_dependencies", []) or meta.get("optional", []) or []
+    conflicts = meta.get("conflicts", []) or []
+    return PackageCandidate(
+        name=str(name),
+        version=str(version) if version is not None else None,
+        provides=provides,
+        depends=depends,
+        conflicts=[str(c) for c in conflicts],
+        optional=[str(o) for o in optional],
+        meta=meta
+    )
+
+def _parse_meta_file(path: str) -> Optional[PackageCandidate]:
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8") as fh:
+            m = yaml.safe_load(fh)
+        if not isinstance(m, dict):
+            return None
+        return _candidate_from_meta(m)
+    except Exception:
+        # try json
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                m = json.load(fh)
+            if isinstance(m, dict):
+                return _candidate_from_meta(m)
+        except Exception:
+            return None
+
+# patching RepoIndex methods into class
+def _repoindex_load(self: RepoIndex):
+    if self._loaded:
+        return
+    # try load index file
+    data = _safe_load_json(self.index_file)
+    if data and isinstance(data, dict):
+        try:
+            # reconstruct provides_index and candidates (minimal)
+            prov = data.get("provides_index", {})
+            self.provides_index = {k: set(v) for k, v in prov.items()}
+            cand_raw = data.get("candidates", {})
+            self.candidates_by_name = {}
+            for name, clist in cand_raw.items():
+                arr = []
+                for c in clist:
+                    arr.append(PackageCandidate(
+                        name=c.get("name"),
+                        version=c.get("version"),
+                        provides=c.get("provides", []),
+                        depends=c.get("depends", []),
+                        conflicts=c.get("conflicts", []),
+                        optional=c.get("optional", []),
+                        meta=c.get("meta", {})
+                    ))
+                self.candidates_by_name[name] = arr
+            self._loaded = True
+            return
+        except Exception:
+            logger.exception("Failed to reconstruct index from file; will rebuild")
+
+    # if no index_file or failed, build by scanning .meta
+    self.provides_index = {}
+    self.candidates_by_name = {}
+    # walk repo_dir
+    for root, _, files in os.walk(self.repo_dir):
+        for fn in files:
+            if fn.endswith(".meta") or fn.endswith(".yml") or fn.endswith(".yaml") or fn.endswith(".json"):
+                full = os.path.join(root, fn)
+                cand = _parse_meta_file(full)
+                if cand:
+                    self.candidates_by_name.setdefault(cand.name, []).append(cand)
+                    # add provides
+                    for p in cand.provides:
+                        self.provides_index.setdefault(p, set()).add(cand.name)
+                    # also add the package name as provider for itself
+                    self.provides_index.setdefault(cand.name, set()).add(cand.name)
+    # persist lightweight index
+    try:
+        tosave = {
+            "provides_index": {k: list(v) for k, v in self.provides_index.items()},
+            "candidates": {}
+        }
+        for name, clist in self.candidates_by_name.items():
+            tosave["candidates"][name] = [{
+                "name": c.name,
+                "version": c.version,
+                "provides": c.provides,
+                "depends": c.depends,
+                "conflicts": c.conflicts,
+                "optional": c.optional,
+                "meta": c.meta
+            } for c in clist]
+        _ensure_dir(os.path.dirname(self.index_file) or ".")
+        with open(self.index_file, "w", encoding="utf-8") as fh:
+            json.dump(tosave, fh, indent=2)
+    except Exception:
+        logger.exception("Failed write index file")
+    self._loaded = True
+
+# attach methods
+RepoIndex.load = _repoindex_load
+
+def _repoindex_find_candidates(self: RepoIndex, req: PackageRequirement) -> List[PackageCandidate]:
+    """
+    Retorna lista de PackageCandidate que potencialmente satisfazem a requirement.
+    A ordem é heurística: preferir versões mais novas (se detectáveis) e providers equal name first.
+    """
+    self.load()
+    out: List[PackageCandidate] = []
+    # providers by virtual name
+    provs = set()
+    if req.name in self.provides_index:
+        provs.update(self.provides_index.get(req.name, set()))
+    # also consider exact name
+    provs.add(req.name)
+    seen = set()
+    # collect candidates
+    for pname in provs:
+        clist = self.candidates_by_name.get(pname) or []
+        for cand in clist:
+            if cand.id() in seen:
+                continue
+            if cand.satisfies(req):
+                out.append(cand)
+                seen.add(cand.id())
+    # heuristic sort: prefer same-name packages, prefer higher version if parsable, prefer locally available (repo_dir)
+    def cand_score(c: PackageCandidate):
+        score = 0
+        if c.name == req.name:
+            score += 1000
+        # version score: newer -> higher
+        v = c.version
+        if v:
+            pv = parse_version(v)
+            if HAS_PACKAGING and isinstance(pv, Version):
+                # convert to comparable number (major*1e6 + minor*1e3 + micro)
+                try:
+                    score += int(pv.release[0]) * 1000000
+                except Exception:
+                    score += 0
+            else:
+                # lexicographic fallback
+                try:
+                    score += int("".join([x for x in v if x.isdigit()])) if any(ch.isdigit() for ch in v) else 0
+                except Exception:
+                    score += 0
+        # prefer packages whose meta is in repo (we don't have remote data here, so neutral)
+        return -score  # negative because we want smaller sort key -> higher priority
+    out.sort(key=cand_score)
     return out
 
-def _find_cycle(nodes: Set[str], graph: Dict[str, Set[str]]) -> List[str]:
-    WHITE, GREY, BLACK = 0,1,2
-    color = {n: WHITE for n in nodes}
-    parent = {}
-    def dfs(u):
-        color[u] = GREY
-        for v in graph.get(u, []):
-            if color[v] == WHITE:
-                parent[v] = u
-                res = dfs(v)
-                if res:
+RepoIndex.find_candidates = _repoindex_find_candidates
+
+def _repoindex_find_best(self: RepoIndex, req: PackageRequirement) -> Optional[PackageCandidate]:
+    """Retorna primeiro candidato (melhor heurística) ou None."""
+    cands = self.find_candidates(req)
+    return cands[0] if cands else None
+
+RepoIndex.find_best = _repoindex_find_best
+# Parte 3/3 — DependencyResolver e API pública
+
+class ResolveResult:
+    def __init__(self, ok: bool, chosen: Optional[Dict[str, PackageCandidate]] = None, order: Optional[List[str]] = None, issues: Optional[List[str]] = None):
+        self.ok = ok
+        self.chosen = chosen or {}  # map name -> candidate
+        self.order = order or []    # topological build order (ids)
+        self.issues = issues or []
+
+class DependencyResolver:
+    """
+    Resolver com backtracking e heurísticas.
+    - repo: RepoIndex
+    - lockfile: path to dependency.lock.json (optional)
+    - max_steps: limit for backtracking attempts to avoid explosion
+    - verbose: logging/trace
+    """
+
+    def __init__(self, repo: Optional[RepoIndex] = None, lockfile: Optional[str] = None, max_steps: int = 10000, verbose: bool = False):
+        self.repo = repo or RepoIndex()
+        self.lockfile = lockfile or os.path.join(self.repo.repo_dir, "dependency.lock.json")
+        self.max_steps = int(max_steps)
+        self.verbose = verbose
+        self._steps = 0
+        # load lock if exists
+        self._lock_data = None
+        if os.path.exists(self.lockfile):
+            try:
+                self._lock_data = _safe_load_json(self.lockfile)
+            except Exception:
+                self._lock_data = None
+
+    # ----------------------
+    # Utility: apply lock
+    # ----------------------
+    def _apply_lock(self, requests: List[PackageRequirement]) -> Optional[Dict[str, PackageCandidate]]:
+        """
+        If lockfile contains exact mapping for the requested root set, return mapping name->candidate
+        The lock key is sorted list of request names (without spec)
+        """
+        if not self._lock_data:
+            return None
+        key = ",".join(sorted([r.name for r in requests]))
+        entry = self._lock_data.get(key)
+        if not entry:
+            return None
+        chosen = {}
+        for name, info in entry.items():
+            # info contains name, version maybe
+            cand = self.repo.find_best(PackageRequirement(name=name, specifier=parse_specifier(f"=={info.get('version')}") if info.get("version") else None))
+            if cand:
+                chosen[name] = cand
+            else:
+                # lock stale
+                return None
+        return chosen
+
+    def _save_lock(self, requests: List[PackageRequirement], chosen: Dict[str, PackageCandidate]) -> None:
+        """Persiste lock para as requests. Keyed por root set."""
+        try:
+            if self._lock_data is None:
+                self._lock_data = {}
+            key = ",".join(sorted([r.name for r in requests]))
+            entry = {}
+            for k, c in chosen.items():
+                entry[k] = {"name": c.name, "version": c.version}
+            self._lock_data[key] = entry
+            with open(self.lockfile, "w", encoding="utf-8") as fh:
+                json.dump(self._lock_data, fh, indent=2)
+            if self.verbose:
+                logger.info("Saved lock for key %s -> %s", key, list(entry.keys()))
+        except Exception:
+            logger.exception("Failed to write lockfile")
+
+    # ----------------------
+    # Core: resolve
+    # ----------------------
+    def resolve(self, requests: Iterable[PackageRequirement], allow_optional: bool = True, prefer_locked: bool = True, timeout: Optional[int] = None) -> ResolveResult:
+        """
+        Resolve a set of root requirements.
+        Returns ResolveResult with chosen candidates and build order.
+        """
+
+        start_ts = time.time()
+        reqs = [r if isinstance(r, PackageRequirement) else PackageRequirement.from_string(str(r)) for r in requests]
+        if self.verbose:
+            logger.info("Resolving requests: %s", [r.raw or r.name for r in reqs])
+
+        # try apply lock
+        if prefer_locked:
+            locked = self._apply_lock(reqs)
+            if locked:
+                # verify consistency (no conflicts)
+                ok, issues = self._verify_selection(locked)
+                if ok:
+                    order = self._topological_order(locked)
+                    return ResolveResult(True, locked, order, [])
+                # else fallthrough to re-resolve
+                if self.verbose:
+                    logger.info("lock found but invalid, re-resolving (%s)", issues)
+
+        # prepare search structures
+        chosen: Dict[str, PackageCandidate] = {}
+        visiting: Set[str] = set()
+        failures: List[str] = []
+        # flatten root dependencies to process in priority queue (heuristic)
+        # We'll implement DFS with backtracking and step limit
+        roots = reqs
+
+        self._steps = 0
+        deadline = time.time() + timeout if timeout else None
+
+        # build a helper recursive backtracking resolver
+        def backtrack(index: int, active_requests: List[PackageRequirement]) -> Optional[Dict[str, PackageCandidate]]:
+            # check step limit
+            self._steps += 1
+            if self._steps > self.max_steps:
+                raise RuntimeError("Max resolution steps exceeded")
+            if deadline and time.time() > deadline:
+                raise RuntimeError("Dependency resolution timed out")
+
+            if index >= len(active_requests):
+                # all root requirements satisfied; but we must ensure transitive deps are satisfied
+                ok, msg = self._verify_selection(chosen, allow_optional=allow_optional)
+                if ok:
+                    return dict(chosen)
+                else:
+                    if self.verbose:
+                        logger.debug("verify_selection failed at leaf: %s", msg)
+                    return None
+
+            req = active_requests[index]
+            # if already chosen a provider for that virtual/name, check spec
+            already = next((c for n, c in chosen.items() if (n == req.name or req.name in c.provides)), None)
+            if already:
+                if already.satisfies(req):
+                    # proceed to next root
+                    return backtrack(index + 1, active_requests)
+                else:
+                    # choice incompatible; fail this branch
+                    return None
+
+            # get candidate list (heuristic ordered)
+            cands = self.repo.find_candidates(req)
+            if not cands:
+                # no candidate found — attempt providers fuzzy match (partial) and record failure
+                failures.append(f"no_candidate_for:{req.raw or req.name}")
+                if self.verbose:
+                    logger.debug("No candidates for req %s", req.raw or req.name)
+                return None
+
+            # try candidates in order
+            for cand in cands:
+                # quick conflicts check against already chosen
+                conflict = False
+                for chosen_name, chosen_c in list(chosen.items()):
+                    # if cand conflicts with chosen_c or vice-versa
+                    if cand.name in chosen_c.conflicts or chosen_c.name in cand.conflicts:
+                        conflict = True
+                        break
+                if conflict:
+                    continue
+                # choose cand
+                chosen_key = cand.name
+                prev = chosen.get(chosen_key)
+                chosen[chosen_key] = cand
+                # add its transitive dependencies to active_requests if not already present
+                trans_reqs: List[PackageRequirement] = []
+                for d in cand.depends:
+                    pr = PackageRequirement.from_string(d)
+                    # skip optional if flag disabled
+                    if pr.name in cand.optional and not allow_optional:
+                        continue
+                    # if already satisfied by chosen, skip
+                    sat = any((pr.name == n) or (pr.name in c.provides) for n, c in chosen.items())
+                    if not sat:
+                        trans_reqs.append(pr)
+                # Build new active_requests list: include transitive requirements right after current index
+                new_active = active_requests[:index+1] + trans_reqs + active_requests[index+1:]
+                try:
+                    res = backtrack(index + 1, new_active)
+                except RuntimeError:
+                    # propagate timeout or steps limit
+                    raise
+                if res is not None:
                     return res
-            elif color[v] == GREY:
-                # reconstruir ciclo
-                path = [v]
-                cur = u
-                while cur != v and cur in parent:
-                    path.append(cur)
-                    cur = parent[cur]
-                path.append(v)
-                path.reverse()
-                return path
-        color[u] = BLACK
-        return None
-    for n in nodes:
-        if color[n] == WHITE:
-            p = dfs(n)
-            if p:
-                return p
-    return ["<unknown>"]
+                # backtrack: undo
+                if prev is not None:
+                    chosen[chosen_key] = prev
+                else:
+                    chosen.pop(chosen_key, None)
+                # continue trying next candidate
+            # exhausted cands -> failure
+            return None
 
-def explain_failure(pkgs: List[str], include_optional=False, prefer_provided=True) -> str:
-    """
-    Rodar resolução e retornar string explicativa se falhar.
-    """
-    try:
-        resolve(pkgs, include_optional=include_optional, prefer_provided=prefer_provided)
-        return "Resolved successfully (no failure to explain)."
-    except Exception as e:
-        return f"Falha ao resolver: {e}"
+        try:
+            result_map = backtrack(0, roots)
+        except RuntimeError as e:
+            return ResolveResult(False, {}, [], [str(e)])
 
-# -----------------------------------------------------
-# API pública
-# -----------------------------------------------------
-def resolve(pkgs: List[str],
-            include_optional: bool = False,
-            prefer_provided: bool = True,
-            reverse: bool = False) -> Tuple[List[str], Dict[str, dict]]:
+        if result_map is None:
+            issues = failures or ["unable_to_resolve"]
+            return ResolveResult(False, {}, [], issues)
+
+        # Verify final selection thoroughly (conflicts, transitive, optional rules)
+        ok, vissues = self._verify_selection(result_map, allow_optional=allow_optional)
+        if not ok:
+            return ResolveResult(False, {}, [], vissues)
+
+        # compute topological order
+        order = self._topological_order(result_map)
+        # save lock
+        try:
+            self._save_lock(reqs, result_map)
+        except Exception:
+            pass
+
+        return ResolveResult(True, result_map, order, [])
+
+    # ----------------------
+    # verification & topological order
+    # ----------------------
+    def _verify_selection(self, chosen_map: Dict[str, PackageCandidate], allow_optional: bool = True) -> Tuple[bool, List[str]]:
+        """
+        Verifica se o conjunto escolhido satisfaz todas dependências transitiveis and has no conflicts.
+        """
+        issues: List[str] = []
+        # Build quick provides map
+        provides = {}
+        for name, cand in chosen_map.items():
+            for p in cand.provides + [cand.name]:
+                provides.setdefault(p, []).append(cand)
+
+        # for each chosen candidate, check its depends
+        for name, cand in chosen_map.items():
+            for d in cand.depends:
+                pr = PackageRequirement.from_string(d)
+                # check any provider in chosen_map provides pr
+                sat = False
+                for p, clist in provides.items():
+                    if p == pr.name or pr.name in p:
+                        # at least one candidate providing p must also satisfy version
+                        for candidate in clist:
+                            if candidate.satisfies(pr):
+                                sat = True
+                                break
+                        if sat:
+                            break
+                if not sat:
+                    # check if optional
+                    if pr.name in cand.optional and allow_optional:
+                        continue
+                    issues.append(f"unsatisfied:{cand.name}->{pr.raw or pr.name}")
+            # conflicts
+            for c in cand.conflicts:
+                # if any chosen candidate matches conflict name -> issue
+                for other_name, other_cand in chosen_map.items():
+                    if other_name == c or c in other_cand.provides:
+                        issues.append(f"conflict:{cand.name}~{other_name}")
+        return (len(issues) == 0, issues)
+
+    def _topological_order(self, chosen_map: Dict[str, PackageCandidate]) -> List[str]:
+        """
+        Retorna ordem topológica de build/instalação (ids). Usa Kahn com dependências restritas ao chosen set.
+        """
+        # build graph nodes = chosen candidate ids
+        nodes = {c.id(): c for c in chosen_map.values()}
+        deps_map: Dict[str, Set[str]] = {nid: set() for nid in nodes.keys()}  # node -> set of node ids it depends on
+        name_to_id = {c.name: c.id() for c in chosen_map.values()}
+
+        for nid, cand in nodes.items():
+            for d in cand.depends:
+                pr = PackageRequirement.from_string(d)
+                # find chosen provider for pr
+                provider_id = None
+                for cname, ccand in chosen_map.items():
+                    if ccand.satisfies(pr):
+                        provider_id = ccand.id()
+                        break
+                if provider_id and provider_id in nodes:
+                    deps_map[nid].add(provider_id)
+        # Kahn algorithm
+        indeg = {nid: 0 for nid in nodes}
+        for nid, deps in deps_map.items():
+            for d in deps:
+                indeg[nid] += 1
+        q = [nid for nid, deg in indeg.items() if deg == 0]
+        order: List[str] = []
+        while q:
+            n = q.pop(0)
+            order.append(n)
+            # remove edges from n
+            for m, deps in deps_map.items():
+                if n in deps:
+                    deps.remove(n)
+                    indeg[m] -= 1
+                    if indeg[m] == 0:
+                        q.append(m)
+        if len(order) != len(nodes):
+            # cycle detected; try heuristic: break cycles by arbitrary order of names
+            # append remaining nodes in deterministic order
+            remaining = [nid for nid in nodes if nid not in order]
+            remaining.sort()
+            order.extend(remaining)
+        return order
+
+    # ----------------------
+    # Diagnostics / explain
+    # ----------------------
+    def explain(self, requests: Iterable[PackageRequirement], depth: int = 2) -> Dict[str, Any]:
+        """
+        Gera relatório explicativo: candidate choices, providers, why failed, suggestions.
+        """
+        reqs = [r if isinstance(r, PackageRequirement) else PackageRequirement.from_string(str(r)) for r in requests]
+        report = {"requests": [r.raw or r.name for r in reqs], "candidates": {}, "providers": {}, "tips": []}
+        for r in reqs:
+            cands = self.repo.find_candidates(r)
+            report["candidates"][r.name] = [c.id() for c in cands]
+            provs = []
+            for c in cands:
+                provs.extend(c.provides)
+            report["providers"][r.name] = sorted(set(provs))
+            if not cands:
+                report["tips"].append(f"No candidates found for {r.raw or r.name}. Check .meta or provides index.")
+        # top-level suggestions
+        if not report["tips"]:
+            report["tips"].append("If resolution fails, try: rebuild lib index, add missing provides to .meta, or pin versions in .meta.")
+        return report
+
+# -----------------------
+# Public API convenience
+# -----------------------
+
+def resolve_requirements(requirements: Iterable[str], repo_dir: Optional[str] = None,
+                         lockfile: Optional[str] = None, max_steps: int = 20000, verbose: bool = False) -> Dict[str, Any]:
     """
-    Resolve dependências complexas usando backtracking. Retorna (ordered_list, metas).
-    ordered_list: dependências primeiro (pronto para build). Se reverse=True, inverte.
+    Conveniência: resolve a partir de strings e retorna dict com results.
     """
-    if not pkgs:
-        return [], {}
-    # garantir index de provides
-    _build_provides_index(force=True)
-    ordered, metas = _resolve_with_backtracking(pkgs, include_optional=include_optional, prefer_provided=prefer_provided)
-    if reverse:
-        ordered.reverse()
-    logger.info("Resolve final: %s", ", ".join(ordered))
-    return ordered, metas
+    repo = RepoIndex(repo_dir=repo_dir)
+    dr = DependencyResolver(repo=repo, lockfile=lockfile, max_steps=max_steps, verbose=verbose)
+    req_objs = [PackageRequirement.from_string(s) for s in requirements]
+    res = dr.resolve(req_objs)
+    out = {"ok": res.ok, "issues": res.issues}
+    if res.ok:
+        out["chosen"] = {k: {"name": c.name, "version": c.version} for k, c in res.chosen.items()}
+        out["order"] = res.order
+    else:
+        out["explain"] = dr.explain(req_objs)
+    return out
+
+# module exports
+__all__ = [
+    "PackageCandidate",
+    "PackageRequirement",
+    "RepoIndex",
+    "DependencyResolver",
+    "ResolveResult",
+    "resolve_requirements",
+        ]
