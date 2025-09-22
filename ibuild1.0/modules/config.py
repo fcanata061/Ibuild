@@ -6,6 +6,7 @@ config.py — Módulo de configuração do ibuild (evoluído)
 - Suporta $IBUILD_CONFIG > ~/.config/ibuild/config.yml > /etc/ibuild/config.yml > defaults
 - Mantém compatibilidade com YAML
 - Permite leitura, escrita, reset e listagem completa da config
+- Inclui campos extras para compilação, sandbox, rollback e toolchain
 """
 
 import os
@@ -15,15 +16,46 @@ import yaml
 USER_CONFIG = os.path.expanduser("~/.config/ibuild/config.yml")
 SYSTEM_CONFIG = "/etc/ibuild/config.yml"
 
-# Valores padrão
+# Valores padrão (completo)
 DEFAULTS = {
-    "repo_dir": "/usr/ibuild",               # onde ficam os .meta
-    "cache_dir": "/var/cache/ibuild",        # sources e pacotes binários
-    "pkg_db": "/var/lib/ibuild/packages",    # pacotes instalados
-    "log_dir": "/var/log/ibuild",            # logs de build/install
+    # Diretórios principais
+    "repo_dir": "/usr/ibuild",
+    "cache_dir": "/var/cache/ibuild",
+    "pkg_db": "/var/lib/ibuild/packages",
+    "log_dir": "/var/log/ibuild",
     "sandbox_dir": "/var/lib/ibuild/sandbox",
+    "snapshots_dir": "/var/lib/ibuild/snapshots",
+
+    # Repositório
     "repo_url": "https://github.com/fcanata061/Ibuild",
+
+    # Fontes adicionais
+    "sources_dir": "/var/cache/ibuild/sources",
+    "packages_dir": "/var/cache/ibuild/packages",
+    "patches_dir": "/usr/ibuild/patches",
+    "hooks_dir": "/usr/ibuild/hooks",
+
+    # Notificações e update
     "notify": True,
+    "auto_update": False,
+    "check_interval": 3600,  # segundos (1h)
+
+    # Compilação
+    "makeflags": "-j4",
+    "cflags": "-O2 -pipe",
+    "cxxflags": "-O2 -pipe",
+    "ldflags": "-Wl,-O1",
+
+    # Sandbox
+    "sandbox_engine": "bwrap",  # bwrap | chroot | docker
+    "sandbox_tmpfs": True,
+
+    # Toolchain
+    "default_gcc": "13.2.0",
+    "default_kernel": "6.9.3",
+
+    # Rollback
+    "keep_snapshots": 5,
 }
 
 _config = DEFAULTS.copy()
@@ -97,7 +129,7 @@ def reset(system: bool = False):
 def ensure_dirs():
     """Garante que diretórios essenciais existem."""
     cfg = load_config()
-    for key in ["cache_dir", "pkg_db", "log_dir", "sandbox_dir"]:
+    for key in ["cache_dir", "pkg_db", "log_dir", "sandbox_dir", "snapshots_dir"]:
         os.makedirs(cfg[key], exist_ok=True)
 
 # Carrega config logo no import
@@ -105,6 +137,6 @@ load_config()
 
 # Execução direta para debug
 if __name__ == "__main__":
-    print("Config atual:")
     import json
+    print("Config atual:")
     print(json.dumps(all(), indent=2, ensure_ascii=False))
