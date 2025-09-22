@@ -1,18 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ibuild - wrapper para o CLI principal
+ibuild - wrapper para o CLI principal com suporte a runtimes personalizados
+
+Este wrapper:
+- garante que o diretório do código-fonte do Ibuild esteja em sys.path
+- injeta no PATH os diretórios `current/bin` das linguagens gerenciadas
+  pelos runtimes (python, ruby, java, node, etc.)
 """
 
 import sys
 import os
 
-# diretório onde está o código real
+# localização padrão do código do Ibuild
 LIB_DIR = "/usr/lib/ibuild1.0"
-
 if LIB_DIR not in sys.path:
     sys.path.insert(0, LIB_DIR)
 
+# Função para injetar runtimes no PATH
+def inject_runtimes_path():
+    from modules import config
+
+    # base de onde os runtimes são instalados
+    pkg_db = config.get("pkg_db")  # ex: "/var/lib/ibuild/packages"
+    runtimes = config.get("runtimes", ["python", "ruby", "java", "node", "go", "php", "perl"])
+
+    for lang in runtimes:
+        # caminho para a versão "current" da linguagem
+        current_bin = os.path.join(pkg_db, "runtimes", lang, "current", "bin")
+        if os.path.isdir(current_bin):
+            # colocar na frente do PATH
+            os.environ["PATH"] = f"{current_bin}{os.pathsep}" + os.environ.get("PATH", "")
+        # opcional: se usuário tem versão local no "~/.local/bin", injeta também
+        user_current = os.path.expanduser(os.path.join("~/.local/bin"))
+        if os.path.isdir(user_current):
+            os.environ["PATH"] = f"{user_current}{os.pathsep}" + os.environ.get("PATH", "")
+
+# injeta runtimes
+try:
+    inject_runtimes_path()
+except Exception:
+    # não falhar o wrapper se algo der errado
+    pass
+
+# importa o CLI principal
 try:
     import cli
 except ImportError as e:
